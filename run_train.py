@@ -21,6 +21,7 @@ parser.add_argument('--semantic_to_token', action='store_true')
 parser.add_argument('--pca_dim', default=64, type=int)
 parser.add_argument('--mean_shift_times_local', default=10, type=int)
 parser.add_argument('--offset_range', default=5, type=int)
+parser.add_argument('--seed', default=0, type=int)
 args, unknown = parser.parse_known_args()
 
 
