@@ -1098,7 +1098,7 @@ def get_point_coords_wrt_box(boxes_coords, point_coords):
     """
     with torch.no_grad():
         # point_coords_wrt_box = point_coords.clone().permute(0, 2, 1)
-        point_coords_wrt_box = point_coords.clone()     
+        point_coords_wrt_box = point_coords.clone()
         point_coords_wrt_box[:, :, 0] -= boxes_coords[:, None, 0]
         point_coords_wrt_box[:, :, 1] -= boxes_coords[:, None, 1]
         point_coords_wrt_box[:, :, 0] = point_coords_wrt_box[:, :, 0] / (
@@ -2535,11 +2535,18 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
 #             losses.update(bbox_results['loss_bbox'])
 #             losses.update(bbox_results['loss_bbox_rec'])
 
+
+        if self.with_bbox:
+            bbox_results = self._bbox_forward_train(x, sampling_results,
+                                                    gt_bboxes, gt_labels,
+                                                    img_metas, img=img)
+            losses.update(bbox_results['loss_bbox'])
+        
         if self.with_reppoints_head:
             reppoint_loss, semantic_centers_split_new = self.reppoints_head.forward_train(
                 [xx.detach() for xx in x], gt_bboxes, semantic_centers_org[0], img_metas, num_parts, gt_masks,
                 fg_maps=map_cos_fg, gt_labels=gt_labels)
-            # pdb.set_trace()
+
             if self.with_deform_sup:
                 semantic_centers_split = semantic_centers_split_new
                 # import copy
@@ -2547,12 +2554,6 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
                 # semantic_centers_split = random_select_half(semantic_centers_split_new)
             losses.update(reppoint_loss)
 
-        if self.with_bbox:
-            bbox_results = self._bbox_forward_train(x, sampling_results,
-                                                    gt_bboxes, gt_labels,
-                                                    img_metas, img=img)
-            losses.update(bbox_results['loss_bbox'])
-            
         # mask head forward and loss
         if self.with_mask:
             # gt_masks_pseudo = self.get_pseudo_gt_masks_from_point_attn()
@@ -2852,6 +2853,7 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
             | (new_sites[:, :, 1] < 0)
             | (new_sites[:, :, 1] > 1)
         )
+        pdb.set_trace()
         mask_targets[point_ignores] = 2
         point_preds = point_sample(
             mask_results["mask_pred"],

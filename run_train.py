@@ -61,5 +61,6 @@ if __name__ == "__main__":
                     optimizer_config.update_interval=2 \
                     lr_config.step=[{args.step1},{args.step2}] \
                     runner.max_epochs={args.max_epochs} \
+                --resume work_dir-proj/epoch_11.pth \
                 --work-dir {args.work_dir} \
                 --gpus {args.num_gpus} --launcher pytorch")
