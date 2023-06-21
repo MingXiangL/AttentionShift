@@ -2286,7 +2286,9 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
             self.semantic_centers_split = semantic_centers_split_ret
             self.attns = attns
             self.map_cos_fg = map_cos_fg
+            self.map_cos_bg = map_cos_bg
             self.num_parts = num_parts
+            self.best_idx = mil_out[2]
 
             return dict(pseudo_gt_labels=gt_labels,
                         pseudo_gt_bboxes=mil_out[0],
@@ -2544,11 +2546,11 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
         
         if self.with_reppoints_head:
             reppoint_loss, semantic_centers_split_new = self.reppoints_head.forward_train(
-                [xx.detach() for xx in x], gt_bboxes, semantic_centers_org[0], img_metas, num_parts, gt_masks,
+                [xx.clone().detach() for xx in x], gt_bboxes, semantic_centers_org[0], img_metas, num_parts, gt_masks,
                 fg_maps=map_cos_fg, gt_labels=gt_labels)
 
-            if self.with_deform_sup:
-                semantic_centers_split = semantic_centers_split_new
+            # if self.with_deform_sup:
+            #     semantic_centers_split = semantic_centers_split_new
                 # import copy
                 # semantic_centers_copy = copy.deepcopy(semantic_centers_split_new)
                 # semantic_centers_split = random_select_half(semantic_centers_split_new)
@@ -2853,7 +2855,6 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
             | (new_sites[:, :, 1] < 0)
             | (new_sites[:, :, 1] > 1)
         )
-        pdb.set_trace()
         mask_targets[point_ignores] = 2
         point_preds = point_sample(
             mask_results["mask_pred"],

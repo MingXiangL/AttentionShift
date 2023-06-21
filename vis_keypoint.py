@@ -538,6 +538,7 @@ for i_c in range(40, len(dataloader)):
         sub_ctr = model.roi_head.reppoints_head.get_pred_by_sample(anchor_list, ctr_pred_all)[0][0]
         sub_sem = model.roi_head.reppoints_head.get_pred_by_sample(anchor_list, sem_pred_all)[0][0]
         num_parts_keep = model.roi_head.reppoints_head.num_parts
+        pdb.set_trace()
         cand_scores = model.roi_head.reppoints_head.cand_scores[0].unflatten(0, (-1, 10)).split(num_parts_keep.tolist())
         core_regions = model.roi_head.reppoints_head.core_regions[0].long().cpu().numpy()
         cls_score = model.roi_head.reppoints_head.part_score
