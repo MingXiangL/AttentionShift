@@ -735,7 +735,6 @@ def cosine_shift(prototypes, feats, tau=0.1, n_shift=5):
 def cosine_shift_self(prototypes, feats, feats_org=None, tau=0.1, temp=0.1, n_shift=5):
     # prototypes.shape: n_block, n_dim
     # feat.shape: n_patches, n_dim
-
     for i_s in range(n_shift):
         sim_map = F.cosine_similarity(prototypes[:, None, :], feats[None, :, :], dim=-1)
         # weight = torch.where(sim_map >= tau, sim_map, torch.zeros_like(sim_map))
@@ -770,6 +769,7 @@ def cosine_shift_batch(prototypes, feats, feats_org=None, tau=0.1, temp=0.1, n_s
         prot_range = torch.arange(prototypes.shape[1], device=feat_idx.device, dtype=feat_idx.dtype)[None, :, None].expand(prototypes.shape[0], prototypes.shape[1], -1)
         mask_weight = torch.where(prot_range==feat_idx, torch.ones_like(weight), torch.zeros_like(weight))
         prototypes = torch.matmul(weight * mask_weight, feats)
+        tau_cp = tau
         tau = update_density_batch(prototypes, feats, mask_weight)
         # print(f'i_s: {i_s}')
         # print(f'prototypes: {prototypes}')
@@ -2549,11 +2549,15 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
                 [xx.clone().detach() for xx in x], gt_bboxes, semantic_centers_org[0], img_metas, num_parts, gt_masks,
                 fg_maps=map_cos_fg, gt_labels=gt_labels)
 
-            # if self.with_deform_sup:
-            #     semantic_centers_split = semantic_centers_split_new
-                # import copy
-                # semantic_centers_copy = copy.deepcopy(semantic_centers_split_new)
-                # semantic_centers_split = random_select_half(semantic_centers_split_new)
+            if self.with_deform_sup:
+                semantic_centers_split = semantic_centers_split_new
+            #     # import copy
+            #     # semantic_centers_copy = copy.deepcopy(semantic_centers_split_new)
+            #     # semantic_centers_split = random_select_half(semantic_centers_split_new)
+            # losses.update(reppoint_loss)
+            # reppoint_loss = self.reppoints_head.forward_train(
+            #     [xx.clone().detach() for xx in x], gt_bboxes, semantic_centers_org[0], img_metas, num_parts, gt_masks,
+            #     fg_maps=map_cos_fg, gt_labels=gt_labels)
             losses.update(reppoint_loss)
 
         # mask head forward and loss

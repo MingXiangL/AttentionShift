@@ -21,7 +21,7 @@ parser.add_argument('--semantic_to_token', action='store_true')
 parser.add_argument('--pca_dim', default=64, type=int)
 parser.add_argument('--mean_shift_times_local', default=10, type=int)
 parser.add_argument('--offset_range', default=5, type=int)
-parser.add_argument('--seed', default=0, type=int)
+parser.add_argument('--seed', default=3, type=int)
 args, unknown = parser.parse_known_args()
 
 
@@ -31,12 +31,14 @@ if __name__ == "__main__":
     # config = 'configs/mae/attnshift_deform_attn_reppoints.py'
     # config = 'configs/mae/attnshift_deform_attn_dense_reppoints.py'
     config = 'configs/mae/attnshift_deform_attn_dense_contour_semantic_reppoints_attn.py'
+    # config = 'configs/mae/attnshift_deform_attn_dense_contour_semantic_reppoints.py'
+    # config = 'configs/mae/attnshift_deform_attn_dense_contour_semantic_reppoints_attn.py'
     # config = 'configs/mae/attnshift_deform_attn_focus_dense_reppoints.py'
     # config = 'configs/mae/imted_small_faster_rcnn_pointsup_pointmasksample_reconstruct_cos_voc12aug_1x_align.py'
     # config = 'configs/mae/imted_small_faster_rcnn_pointsup_pointmasksample_reconstruct_cos_voc12aug_1x.py'
     
     config_name = os.path.basename(config).split('.')[0]
-    os.system(f"python -m torch.distributed.launch --nproc_per_node={args.num_gpus} --master_port=12345 --use_env ./tools/train.py \
+    os.system(f"python -m torch.distributed.launch --nproc_per_node={args.num_gpus} --master_port=33333 --use_env ./tools/train.py \
                 {config} --cfg-options \
                     model.backbone.use_checkpoint=True \
                     model.roi_head.bbox_head.seed_score_thr=0.05 \
@@ -61,6 +63,7 @@ if __name__ == "__main__":
                     optimizer_config.update_interval=2 \
                     lr_config.step=[{args.step1},{args.step2}] \
                     runner.max_epochs={args.max_epochs} \
+                --resume work_dir-proj/epoch_11.pth \
                 --seed {args.seed} \
                 --work-dir {args.work_dir} \
                 --gpus {args.num_gpus} --launcher pytorch")
