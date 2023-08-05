@@ -14,10 +14,10 @@ parser.add_argument('--max_epochs', default=12, type=int)
 parser.add_argument('--corr_size', default=21, type=int)
 parser.add_argument('--scale_factor', default=2, type=int)
 parser.add_argument('--obj_tau', default=0.90, type=float)
-parser.add_argument('--num_gpus', default=8, type=int)
+parser.add_argument('--num_gpus', default=4, type=int)
 parser.add_argument('--num_semantic_points', default=5, type=int)
 parser.add_argument('--epoch_semantic_centers', default=0, type=int)
-parser.add_argument('--semantic_to_token', action='store_true')
+parser.add_argument('--semantic_to_token', action='store_false') 
 parser.add_argument('--pca_dim', default=64, type=int)
 parser.add_argument('--mean_shift_times_local', default=10, type=int)
 parser.add_argument('--offset_range', default=5, type=int)
@@ -30,7 +30,7 @@ if __name__ == "__main__":
     # config = 'configs/mae/attnshift_deform_attn_norm.py'
     # config = 'configs/mae/attnshift_deform_attn_reppoints.py'
     # config = 'configs/mae/attnshift_deform_attn_dense_reppoints.py'
-    config = 'configs/mae/attnshift_deform_attn_dense_contour_semantic_reppoints_attn.py'
+    config = 'configs/mae/attnshift_deform_attn_dense_contour_semantic_reppoints_attn_high_res.py'
     # config = 'configs/mae/attnshift_deform_attn_dense_contour_semantic_reppoints.py'
     # config = 'configs/mae/attnshift_deform_attn_dense_contour_semantic_reppoints_attn.py'
     # config = 'configs/mae/attnshift_deform_attn_focus_dense_reppoints.py'
@@ -38,7 +38,7 @@ if __name__ == "__main__":
     # config = 'configs/mae/imted_small_faster_rcnn_pointsup_pointmasksample_reconstruct_cos_voc12aug_1x.py'
     
     config_name = os.path.basename(config).split('.')[0]
-    os.system(f"python -m torch.distributed.launch --nproc_per_node={args.num_gpus} --master_port=33333 --use_env ./tools/train.py \
+    os.system(f"python -m torch.distributed.launch --nproc_per_node={args.num_gpus} --master_port=12345 --use_env ./tools/train.py \
                 {config} --cfg-options \
                     model.backbone.use_checkpoint=True \
                     model.roi_head.bbox_head.seed_score_thr=0.05 \
@@ -53,7 +53,7 @@ if __name__ == "__main__":
                     model.corr_size={args.corr_size} \
                     model.obj_tau={args.obj_tau} \
                     model.roi_head.mask_head.scale_factor={args.scale_factor} \
-                    data.samples_per_gpu=1 \
+                    data.samples_per_gpu=2 \
                     data.workers_per_gpu=2 \
                     model.roi_head.num_semantic_points={args.num_semantic_points} \
                     model.roi_head.epoch_semantic_centers={args.epoch_semantic_centers} \
@@ -63,7 +63,6 @@ if __name__ == "__main__":
                     optimizer_config.update_interval=2 \
                     lr_config.step=[{args.step1},{args.step2}] \
                     runner.max_epochs={args.max_epochs} \
-                --resume work_dir-proj/epoch_11.pth \
                 --seed {args.seed} \
                 --work-dir {args.work_dir} \
                 --gpus {args.num_gpus} --launcher pytorch")
