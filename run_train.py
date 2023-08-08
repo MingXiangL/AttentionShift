@@ -17,7 +17,7 @@ parser.add_argument('--obj_tau', default=0.90, type=float)
 parser.add_argument('--num_gpus', default=4, type=int)
 parser.add_argument('--num_semantic_points', default=5, type=int)
 parser.add_argument('--epoch_semantic_centers', default=0, type=int)
-parser.add_argument('--semantic_to_token', action='store_false') 
+parser.add_argument('--semantic_to_token', action='store_true') 
 parser.add_argument('--pca_dim', default=64, type=int)
 parser.add_argument('--mean_shift_times_local', default=10, type=int)
 parser.add_argument('--offset_range', default=5, type=int)
@@ -30,7 +30,7 @@ if __name__ == "__main__":
     # config = 'configs/mae/attnshift_deform_attn_norm.py'
     # config = 'configs/mae/attnshift_deform_attn_reppoints.py'
     # config = 'configs/mae/attnshift_deform_attn_dense_reppoints.py'
-    config = 'configs/mae/attnshift_deform_attn_dense_contour_semantic_reppoints_attn_high_res.py'
+    config = 'configs/rand_points/attnshift_deform_attn_dense_contour_semantic_reppoints_attn_randpoints.py'
     # config = 'configs/mae/attnshift_deform_attn_dense_contour_semantic_reppoints.py'
     # config = 'configs/mae/attnshift_deform_attn_dense_contour_semantic_reppoints_attn.py'
     # config = 'configs/mae/attnshift_deform_attn_focus_dense_reppoints.py'

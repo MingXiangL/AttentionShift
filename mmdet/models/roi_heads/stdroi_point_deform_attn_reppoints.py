@@ -198,6 +198,7 @@ def get_center_coord_with_feat(maps, rois, obj_label, vit_feats, num_max_keep=50
     coords = []
     labels = []
     feats  = []
+    correspond_gt = []
     split_size = [0 for _ in range(len(maps))]
     for i_obj, map_ in enumerate(maps):
         if map_.shape[0] == 0:
@@ -215,11 +216,12 @@ def get_center_coord_with_feat(maps, rois, obj_label, vit_feats, num_max_keep=50
             if (coord[0] >= xmin) & (coord[0] <= xmax) & (coord[1] >= ymin) & (coord[1] <= ymax):
                 coords.append(coord)
                 labels.append(label)
+                correspond_gt.append(i_obj)
                 feats.append(vit_feats[:, coord_top2_mean[1].long(), coord_top2_mean[0].long()])
                 split_size[i_obj] += 1
 
     if len(coords) == 0:
-        return [torch.zeros(0, 2, dtype=rois[0].dtype, device=rois[0].device), torch.zeros(0, dtype=obj_label[0].dtype, device=obj_label[0].device)], [], [], [], split_size, torch.zeros(0, 2, dtype=rois[0].dtype, device=rois[0].device), torch.zeros(0, dtype=obj_label[0].dtype, device=obj_label[0].device)
+        return [torch.zeros(0, 2, dtype=rois[0].dtype, device=rois[0].device), torch.zeros(0, dtype=obj_label[0].dtype, device=obj_label[0].device)], [], [], [], split_size, torch.zeros(0, 2, dtype=rois[0].dtype, device=rois[0].device), torch.zeros(0, dtype=obj_label[0].dtype, device=obj_label[0].device), torch.zeros(0, dtype=torch.long, device=obj_label[0].device)
     else:
         coords = torch.stack(coords)
         labels = torch.stack(labels)
@@ -232,7 +234,7 @@ def get_center_coord_with_feat(maps, rois, obj_label, vit_feats, num_max_keep=50
             idx_chosen = torch.randperm(coords.shape[0], device=coords.device)[:num_max_keep]
             coords = coords[idx_chosen]
             labels = labels[idx_chosen]
-        return [coords, labels], coord_split, feats_split, feats, split_size, coords_org, labels_org
+        return [coords, labels], coord_split, feats_split, feats, split_size, coords_org, labels_org, torch.tensor(correspond_gt,device=coords_org.device, dtype=torch.long)
 
 
 def filter_maps(maps, pos_maps, neg_maps, pos_thr=0.85, neg_thr=0.8):
@@ -1953,8 +1955,8 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
         sim_fg = [cal_similarity(prot, vit_feat_pca.permute(1,2,0)) for prot in prototypes_fg]
         # coord_semantic_center, coord_semantic_center_split = get_center_coord(sim_fg, rois, gt_labels, num_max_obj=num_semantic_points)
         # return coord_semantic_center, coord_semantic_center_split, sim_fg
-        coord_semantic_center, coord_semantic_center_split, feat_semantic_center_split, feat_semantic_center, num_parts, coord_sc_org, label_sc_org  = get_center_coord_with_feat(sim_fg, rois, gt_labels, vit_feat, num_max_obj=num_semantic_points)
-        return coord_semantic_center, coord_semantic_center_split, sim_fg, feat_semantic_center_split, feat_semantic_center, num_parts, coord_sc_org, label_sc_org
+        coord_semantic_center, coord_semantic_center_split, feat_semantic_center_split, feat_semantic_center, num_parts, coord_sc_org, label_sc_org, corres_gt  = get_center_coord_with_feat(sim_fg, rois, gt_labels, vit_feat, num_max_obj=num_semantic_points)
+        return coord_semantic_center, coord_semantic_center_split, sim_fg, feat_semantic_center_split, feat_semantic_center, num_parts, coord_sc_org, label_sc_org, corres_gt
 
 
     def get_mask_sample_points_roi_best_attn_local_global(self, 
@@ -2168,18 +2170,18 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
             for i in range(num_imgs):
                 normalize_point_cc = point_reg[i].detach()
                 assign_result = self.point_assigner.assign(
-                    normalize_point_cc, point_cls[i], (gt_points[i][:, :2] + gt_points[i][:, 2:]) / 2,
+                    normalize_point_cc, point_cls[i], gt_points[i],
                     gt_points_labels[i], img_metas[i]
                 )
                 point_sampling_result = self.point_sampler.sample(
                     assign_result, point_reg[i], 
-                    (gt_points[i][:, :2] + gt_points[i][:, 2:]) / 2
+                    gt_points[i]
                 )
                 point_assign_results.append(point_sampling_result)
             pos_inds = [sample_results.pos_inds for sample_results in point_assign_results]
             
             labels, _, point_targets, _ = self.get_targets(
-                point_assign_results, (gt_points[i][:, :2] + gt_points[i][:, 2:]) / 2, gt_points_labels, self.train_cfg,
+                point_assign_results, gt_points[i], gt_points_labels, self.train_cfg,
                 concat=False)
             
         patch_h, patch_w = x[2].size(-2), x[2].size(-1)
@@ -2248,14 +2250,15 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
         semantic_centers_feat_split = []
         semantic_centers_feat = []
         num_parts = []
-        center_points = [(p[:, :2] + p[:, 2:]) / 2 for p in gt_points]
+        center_points = gt_points
         coords_sc_org = []
         labels_sc_org = []
         pseudo_gt_masks = []
+        corres_gts = []
         for i_img in range(num_imgs):
             coord_point, labels_point, map_cos_fg, map_cos_bg, points_bg, points_fg = self.get_mask_sample_points_roi_best_attn_feat_refine(attn_maps_dealed[i_img], mil_out[0][i_img], gt_box_index[i_img], 
                                                         vit_feat=vit_feat[i_img].clone(), pos_thr=pos_mask_thr, neg_thr=neg_mask_thr, num_gt=num_mask_point_gt, obj_tau=obj_tau, gt_points=center_points[i_img])
-            semantic_centers, semantic_centers_split, sim_fg, feat_semantic_center_split, feat_semantic_centers, num_parts_obj, coord_sc_org, label_sc_org = self.get_semantic_centers(map_cos_fg[-1].clone(), 
+            semantic_centers, semantic_centers_split, sim_fg, feat_semantic_center_split, feat_semantic_centers, num_parts_obj, coord_sc_org, label_sc_org, corres_gt = self.get_semantic_centers(map_cos_fg[-1].clone(), 
                                                         map_cos_bg[-1].clone(), 
                                                         mil_out[0][i_img], 
                                                         vit_feat[i_img].clone(), 
@@ -2275,6 +2278,7 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
             num_parts.append(num_parts_obj)
             coords_sc_org.append(coord_sc_org)
             labels_sc_org.append(label_sc_org)
+            corres_gts.append(corres_gt)
             pseudo_gt_masks.append(torch.where(map_cos_fg[-1] > map_cos_fg[-1].flatten(1).max(1)[0][:, None, None] * pos_mask_thr, 
                                               torch.ones_like(map_cos_fg[-1]), 
                                               torch.zeros_like(map_cos_fg[-1])).to(torch.uint8).detach().cpu().numpy())
@@ -2309,6 +2313,7 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
                         num_parts=num_parts,
                         semantic_centers_org=(coords_sc_org, labels_sc_org),
                         pseudo_gt_masks=pseudo_gt_masks,
+                        corres_gts=corres_gts,
                         )
         else:
             return dict(pseudo_gt_labels=gt_labels,
@@ -2325,6 +2330,7 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
                         num_parts=num_parts,
                         semantic_centers_org=(coords_sc_org, labels_sc_org),
                         pseudo_gt_masks=pseudo_gt_masks,
+                        corres_gts=corres_gts,
                         )
     
 #     def seed_pseudo_gt(self,
@@ -2450,6 +2456,7 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
                       num_parts=None,
                       semantic_centers_org=None, #semantic_centers的数量比较少，因为有上限，而semantic_centers_org没有上限
                       map_cos_fg=None,
+                      sc_corres_gts=None,
                       ):
         """
         Args:
@@ -2480,18 +2487,24 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
             point_assign_results = []
             for i in range(num_imgs):
                 normalize_point_cc = point_reg[i].detach()
-                point_coords = (gt_points[i][:, :2] + gt_points[i][:, 2:]) / 2
+                point_coords = gt_points[i]
                 point_labels = gt_points_labels[i]
+                points_coords_reg_target = point_coords
                 if (self.epoch >= self.epoch_semantic_centers) and (semantic_centers is not None) and self.semantic_to_token:
                     point_coords = torch.cat((point_coords, semantic_centers[i][0]), dim=0)
                     point_labels = torch.cat((point_labels, semantic_centers[i][1]), dim=0)
+                    if sc_corres_gts is not None:
+                        sc_corres_gt = sc_corres_gts[i]
+                        points_coords_reg_target = torch.cat((point_coords, point_coords[sc_corres_gt]), dim=0)
+                    else:
+                        points_coords_reg_target = point_coords
                 assign_result = self.point_assigner.assign(
                     normalize_point_cc, point_cls[i], point_coords,
                     point_labels, img_metas[i]
                 )
                 point_sampling_result = self.point_sampler.sample(
                     assign_result, point_reg[i], 
-                    point_coords
+                    points_coords_reg_target
                 )
                 point_assign_results.append(point_sampling_result)
             bbox_targets = self.get_targets(
