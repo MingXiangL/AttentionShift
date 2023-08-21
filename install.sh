@@ -9,3 +9,7 @@ pip install numba Cython \
 
 cd apex-master
 pip install -v --disable-pip-version-check --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./
+
+cd Connected_components_PyTorch
+python3 setup.py install
+python3 setup.py test
