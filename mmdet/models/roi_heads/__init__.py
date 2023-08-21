@@ -18,17 +18,10 @@ from .roi_extractors import SingleRoIExtractor
 from .scnet_roi_head import SCNetRoIHead
 from .shared_heads import ResLayer
 from .sparse_roi_head import SparseRoIHead
-from .standard_roi_head_point2mask import StandardRoIHeadPoint2Mask
 from .standard_roi_head import StandardRoIHead
 from .trident_roi_head import TridentRoIHead
 from .mae_head import MAEDecoderHead
-from .standard_roi_head_mask_point_sample import StandardRoIHeadMaskPointSample
-from .standard_roi_head_mask_point_sample_rec import StandardRoIHeadMaskPointSampleRec
-from .standard_roi_head_mask_point_sample_rec_align import StandardRoIHeadMaskPointSampleRecAlign
-from .standard_roi_head_mask_point_sample_rec_align_teacher_student import StandardRoIHeadMaskPointSampleRecAlignTS
-from .stdroi_point_align_ts_project import StandardRoIHeadMaskPointSampleRecAlignTSProject
-from .stdroi_point_deform_attn import StandardRoIHeadMaskPointSampleDeformAttn
-from .stdroi_point_deform_attn_reppoints import StandardRoIHeadMaskPointSampleDeformAttnReppoints
+from .stdroi_point_deform_attn_reppoints import AttnShiftRoIHead
 
 __all__ = [
     'BaseRoIHead', 'CascadeRoIHead', 'DoubleHeadRoIHead', 'MaskScoringRoIHead',
@@ -40,8 +33,5 @@ __all__ = [
     'CoarseMaskHead', 'DynamicRoIHead', 'SparseRoIHead', 'TridentRoIHead',
     'SCNetRoIHead', 'SCNetMaskHead', 'SCNetSemanticHead', 'SCNetBBoxHead',
     'FeatureRelayHead', 'GlobalContextHead', 'MAEDecoderHead', 'StandardRoIHead', 
-    'StandardRoIHeadPoint2Mask', 'StandardRoIHeadMaskPointSample', 'StandardRoIHeadMaskPointSampleRec',
-    'StandardRoIHeadMaskPointSampleRecAlign', 'StandardRoIHeadMaskPointSampleRecAlignTS',
-    'StandardRoIHeadMaskPointSampleRecAlignTSProject', 'StandardRoIHeadMaskPointSampleDeformAttn',
-    'StandardRoIHeadMaskPointSampleDeformAttnReppoints'
+    'AttnShiftRoIHead'
 ]

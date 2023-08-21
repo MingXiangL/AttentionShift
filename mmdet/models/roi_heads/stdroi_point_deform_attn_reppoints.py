@@ -23,14 +23,6 @@ import random
 from cc_torch import connected_components_labeling
 from ..utils import ObjectQueues, ObjectFactory, cosine_distance, cosine_distance_part
 
-# from torchpq.clustering import MultiKMeans
-def random_select_half(point_list_img):
-    for i_img in range(len(point_list_img)):
-        for i_obj in range(len(point_list_img[i_img])):
-            N = point_list_img[i_img][i_obj].shape[0]
-            idx = random.sample(range(N) , N//2)
-            point_list_img[i_img][i_obj] = point_list_img[i_img][i_obj][idx]
-    return point_list_img
 
 def get_bbox_from_cam_fast(cam, point, cam_thr=0.2, area_ratio=0.5, 
                       img_size=None, box_method='expand', erode=False):
@@ -1203,59 +1195,9 @@ def attns_project_to_feature(attns_maps):
     reverse_joint_attentions = reverse_joint_attentions.permute(1, 0, 2, 3)
     return reverse_joint_attentions
 
-# def attns_project_to_feature(attns_maps):
-#     #         assert len(attns_maps[1]) == 1 
-#     # [block_num], B, H, all_num, all_num
-#     attns_maps = torch.stack(attns_maps)
-#     # block_num, B, H, all_num, all_num
-# #     attns_maps = attns_maps.mean(2)
-#     # block_num, B, all_num, all_num
-#     residual_att = torch.eye(attns_maps.size(2)).type_as(attns_maps)
-#     aug_att_mat = attns_maps + residual_att
-#     aug_att_mat = aug_att_mat / aug_att_mat.sum(-1).unsqueeze(-1)
-
-#     joint_attentions = torch.zeros(aug_att_mat.size()).type_as(aug_att_mat)
-#     joint_attentions[0] = aug_att_mat[0]
-
-#     for n in range(1, aug_att_mat.size(0)):
-#         joint_attentions[n] = torch.matmul(aug_att_mat[n], joint_attentions[n - 1])
-#     attn_proj_map = joint_attentions[-1]
-# #     return joint_attentions
-#     return attn_proj_map
-
-# def attns_project_to_feature(attns_maps, num_proposals=None, cam_layers=None, patch_size=None, pos_inds=None):
-#     patch_h, patch_w = patch_size
-# #     # [block_num], B, H, all_num, all_num
-#     attns_maps = torch.stack(attns_maps).detach()
-#     # block_num, B, H, all_num, all_num
-#     attns_maps = attns_maps.mean(2)
-#     # block_num, B, all_num, all_num
-#     point_token_attn_maps = []
-#     for layer in cam_layers:
-#         attns_maps_ = attns_maps[layer:]
-#         residual_att = torch.eye(attns_maps_.size(2)).type_as(attns_maps_)
-#         aug_att_mat = attns_maps_ + residual_att
-#         aug_att_mat = aug_att_mat / aug_att_mat.sum(-1).unsqueeze(-1)
-
-#         joint_attentions = torch.zeros(aug_att_mat.size()).type_as(aug_att_mat)
-#         joint_attentions[0] = aug_att_mat[0]
-
-#         for n in range(1, aug_att_mat.size(0)):
-#             joint_attentions[n] = torch.matmul(aug_att_mat[n], joint_attentions[n - 1])
-#         attn_proj_map = joint_attentions[-1][-num_proposals:, 1:-num_proposals]
-#         attn_proj_map = attn_proj_map.reshape(-1, 1, patch_h, patch_w)
-#         attn_proj_map = F.interpolate(attn_proj_map, (patch_h * 16, patch_w * 16), 
-#                                       mode='bilinear').reshape(-1, patch_h * 16, patch_w * 16).cpu().numpy() # 100, H, W
-#         point_token_attn_maps.append(attn_proj_map)
-#         print(attn_proj_map.size())
-# #     point_token_attn_maps = torch.stack(point_token_attn_maps, dim=0)
-# #     print(point_token_attn_maps.size())
-#     exit()
-# #     return joint_attentions
-#     return attn_proj_map
 
 @HEADS.register_module()
-class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
+class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
     """Simplest base roi head including one bbox head and one mask head."""
 
     def __init__(self,
@@ -1276,7 +1218,6 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
                  semantic_to_token=False,
                  pca_dim=128,
                  mean_shift_times_local=10,
-                 reppoints_head=None,
                  ):
         super().__init__()
         self.train_cfg = train_cfg
@@ -1301,12 +1242,6 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
             self.with_mae_head = True
         else:
             self.with_mae_head = False
-
-        if reppoints_head is not None:
-            self.reppoints_head = build_head(reppoints_head)
-            self.with_reppoints_head = True
-        else:
-            self.with_reppoints_head = False
             
         self.visualize = visualize
         self.epoch_semantic_centers = epoch_semantic_centers
@@ -1418,103 +1353,6 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
             outs = outs + (mask_results['mask_pred'], )
         return outs
 
-    def point2bbox(self,
-                   x,
-                   img_metas,
-                   proposal_list,
-                   gt_bboxes,
-                   gt_labels,
-                   gt_bboxes_ignore=None,
-                   gt_masks=None,
-                   vit_feat=None,
-                   img=None,
-                   point_init=None,
-                   point_cls=None,
-                   point_reg=None,
-                   imgs_whwh=None,
-                   attns=None,
-                   scale_factor=None,
-                  ):
-        patch_h, patch_w = x[2].size(-2), x[2].size(-1)
-        num_proposals = point_cls.size(1)
-        # attention maps
-        joint_attentions = attns_project_to_feature(attns[self.bbox_head.cam_layer:])
-#         cams = joint_attentions[-1][:, -num_proposals:, 1:-num_proposals].reshape(-1, num_proposals, patch_h, patch_w)
-        cams = joint_attentions[:, -num_proposals:, 1:-num_proposals].reshape(-1, num_proposals, patch_h, patch_w)
-        cams = F.interpolate(cams, (patch_h * 16, patch_w * 16), mode='bilinear')
-        # seed proposal
-        scores = point_cls.sigmoid()  # 获得proposal的真实得分
-        scores, label_inds = scores.max(-1)  # 获得proposal label
-        points_locations = imgs_whwh * point_reg  # 获得最终点的位置
-
-#         pseudo_gt_scores = []
-        pseudo_gt_labels = []
-        pseudo_gt_bboxes = []
-        
-        for scores_per_img, pseudo_labels_per_img, point_locations_per_img, cam_per_img in zip(scores, label_inds, points_locations, cams):
-            pseudo_inds = scores_per_img >= self.bbox_head.seed_score_thr
-#             print(self.bbox_head.seed_score_thr, self.bbox_head.cam_layer)
-            if sum(pseudo_inds) == 0:
-                pseudo_gt_bboxes.append(torch.empty(0, 5))
-                pseudo_gt_labels.append(torch.empty(0))
-                continue
-            
-            pseudo_scores = scores_per_img[pseudo_inds]
-
-            pseudo_labels = pseudo_labels_per_img[pseudo_inds]
-            pseudo_labels_per_img = pseudo_labels.to(point_cls.device).long()
-            
-            pseudo_point_locations = point_locations_per_img[pseudo_inds]
-            pseudo_gt_bboxes_per_img = []
-            cam_ = cam_per_img[pseudo_inds]
-            
-            cam_ = cam_.detach().cpu().numpy()
-            pseudo_point_locations = pseudo_point_locations.detach().cpu().numpy()
-            for c, p in zip(cam_, pseudo_point_locations):
-                c = (c - c.min()) / (c.max() - c.min())
-                pseudo_gt_bbox = get_multi_bboxes(c,
-                                                  p,
-                                                  cam_thr=self.bbox_head.seed_thr, 
-                                                  area_ratio=self.bbox_head.seed_multiple)
-                pseudo_gt_bbox = torch.as_tensor(pseudo_gt_bbox, dtype=pseudo_point_locations.dtype, device=point_cls.device)
-                pseudo_gt_bboxes_per_img.append(pseudo_gt_bbox)
-            pseudo_gt_bboxes_per_img = torch.cat(pseudo_gt_bboxes_per_img, dim=0)
-            
-            del cam_
-            del pseudo_point_locations
-            
-            if not isinstance(scale_factor, tuple):
-                scale_factor = tuple([scale_factor])
-            # B, 1, bboxes.size(-1)
-            scale_factor = pseudo_gt_bboxes_per_img.new_tensor(scale_factor)
-            pseudo_gt_bboxes_per_img /= scale_factor
-            
-            pseudo_gt_bboxes_per_img = torch.cat([pseudo_gt_bboxes_per_img, pseudo_scores.unsqueeze(-1)], dim=1)
-#             pseudo_gt_scores.append(pseudo_scores)
-            pseudo_gt_bboxes.append(pseudo_gt_bboxes_per_img)
-            pseudo_gt_labels.append(pseudo_labels_per_img)
-            
-        return pseudo_gt_bboxes, pseudo_gt_labels
-
-    def transfer_to_cam(self, attn_maps):
-        n_layer, n_gt, h, w = attn_maps.shape
-        if torch.numel(attn_maps) == 0:
-            return torch.zeros(n_layer, 0, h, w, device=attn_maps.device), torch.zeros(n_layer, 0, h, w, device=attn_maps.device)
-
-        max_val, _ = attn_maps.flatten(-2).max(dim=-1, keepdim=True)
-        min_val, _ = attn_maps.flatten(-2).min(dim=-1, keepdim=True)
-        max_val = max_val.unsqueeze(-1)
-        min_val = min_val.unsqueeze(-1)
-        attn_maps_cam = (attn_maps  - min_val) / (max_val - min_val)
-        pos_idx = attn_maps_cam >= 0.2
-        ignore_idx = (attn_maps_cam < 0.2) & (attn_maps_cam > 0.1)
-        cams = torch.zeros_like(attn_maps_cam)
-        ignore_mask = torch.zeros_like(attn_maps_cam)
-        ignore_mask[ignore_idx] = 1.
-        cams[pos_idx] = 1.
-        
-        return cams, ignore_mask
-
     def get_map_coords(self, h, w, device, dtype):
         range_h = torch.arange(h, device=device, dtype=dtype)
         range_w = torch.arange(w, device=device, dtype=dtype)
@@ -1544,50 +1382,6 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
         labels_chosen= torch.stack(label_chosen)
         return coords_chosen, labels_chosen
         
-#     def get_mask_points_single_instance(self, coords, attn_map, cls_p, pos_thr=0.1, neg_thr=0.01, num_gt=10):
-#         # Parameters:
-#         #     coords: num_pixels, 2
-#         #     attn:H, W
-#         #     cls: scalar,
-#         # Return:
-#         #     coords_chosen: num_gt, 2
-#         #     labels_chosen: num_gt
-#         attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min())
-#         idx_pos = (attn_map > pos_thr).nonzero(as_tuple=False)
-#         idx_neg = (attn_map < neg_thr).nonzero(as_tuple=False)
-#         num_pos_tot = idx_pos.shape[0]
-#         pos_neg_idx = torch.cat([idx_pos, idx_neg], dim=0)
-#         num_anno = pos_neg_idx.shape[0]
-#         idx_shuffle = np.arange(num_anno)
-#         np.random.shuffle(idx_shuffle)
-#         idx_shuffle_topk = torch.from_numpy(idx_shuffle[:num_gt]).to(attn_map.device)
-#         idx_chosen = pos_neg_idx[idx_shuffle_topk]
-#         coords_chosen = coords[idx_chosen[:,0], idx_chosen[:,1]]
-
-#         # TODO: 这里面正例点的数量远远大于反例点的数量，是否需要调节阈值？
-#         labels_chosen = (idx_shuffle_topk < num_pos_tot)
-#         return coords_chosen, labels_chosen
-    # def get_mask_points_single_instance(self, coords, attn_map, cls_p, pos_thr=0.1, neg_thr=0.01, num_gt=10,i=0):
-    #     # Parameters:
-    #     #     coords: num_pixels, 2
-    #     #     attn:H, W
-    #     #     cls: scalar,
-    #     # Return:
-    #     #     coords_chosen: num_gt, 2
-    #     #     labels_chosen: num_gt
-    #     device = attn_map.device
-    #     attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min())
-    #     coord_pos = (attn_map > pos_thr).nonzero(as_tuple=False)
-    #     coord_neg = (attn_map < neg_thr).nonzero(as_tuple=False)
-    #     idx_chosen_pos = torch.randperm(coord_pos.shape[0], device=attn_map.device)[:num_gt//2]
-    #     idx_chosen_neg = torch.randperm(coord_neg.shape[0], device=attn_map.device)[:num_gt//2]
-    #     coords_chosen_pos = coord_pos[idx_chosen_pos]
-    #     coords_chosen_neg = coord_neg[idx_chosen_neg]
-    #     coords_chosen = torch.cat([coords_chosen_pos, coords_chosen_neg], dim=0)
-    #     labels_chosen = torch.cat((torch.ones(coords_chosen_pos.shape[0], device=device, dtype=torch.bool),
-    #                                 torch.zeros(coords_chosen_neg.shape[0], device=device, dtype=torch.bool)), dim=0)
-    #     return coords_chosen, labels_chosen
-
     def get_mask_sample_points_roi(self, attn, rois, pos_thr=0.2, neg_thr=0.5, num_gt=20, corr_size=21):
         # Parameters:
         #     attn: num_layers, num_points, H, W
@@ -1640,19 +1434,8 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
         return coords_chosen, labels_chosen
 
     def mean_shift_refine_prototype(self, map_cos_fg, map_cos_bg, prototype_fg, prototype_bg, vit_feat, rois, n_shift=5, output_size=(4,4), tau=0.1):
-        # print(f'map_cos_fg.shape: {map_cos_fg.shape}')
-        # print(f'map_cos_bg.shape: {map_cos_bg.shape}')
-        # print(f'prototype_fg.shape: {prototype_fg.shape}')
-        # print(f'prototype_bg.shape: {prototype_bg.shape}')
-        # print(f'vit_feat.shape: {vit_feat.shape}')
-        # print(f'rois.shape: {rois.shape}')
-        # objectness = F.interpolate((map_cos_fg - map_cos_bg).unsqueeze(0), scale_factor=1/16.0, mode='bilinear')[0]
-        # fg_down_sample = F.interpolate(map_cos_fg.unsqueeze(0), scale_factor=1/16.0, mode='bilinear')[0]
-        # bg_down_sample = F.interpolate(map_cos_bg.unsqueeze(0), scale_factor=1/16.0, mode='bilinear')[0]
         objectness = F.interpolate(map_cos_fg.unsqueeze(0), scale_factor=1/16.0, mode='bilinear')[0]
         uncertainty = 3 - F.interpolate(torch.abs(map_cos_fg - map_cos_bg).unsqueeze(0), scale_factor=1/16.0, mode='bilinear')[0]
-        # TODO: debug
-        # get prototypes of earch instance
         prototypes = []
         for box, uc, ob in zip((rois/16).long().tolist(), uncertainty, objectness):
             xmin, ymin, xmax, ymax = box
@@ -1679,29 +1462,8 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
             
             # prototypes.append(torch.cat([prototype_easy, prototype_hard], dim=0))
         prototypes = torch.stack(prototypes)
-        # sim = cosine_shift_self(vit_feat.flatten(-2).transpose(0,1).clone(), 
-        #                                         vit_feat.flatten(-2).transpose(0,1).clone(), tau=tau, n_shift=n_shift)
-        # sim = sim.unflatten(0, vit_feat.shape[-2:])
-        # max_sim = sim.max(dim=-1, keepdim=True)[0]
-        # sim_is_max = sim == max_sim
-        # sim_is_max = sim_is_max.unflatten(-1, vit_feat.shape[-2:])
-        # sim_is_max = sim_is_max[None,:,:,:,:] * (objectness>0.1)[:,None,None,:,:]
-        # sim_is_max = sim_is_max.sum(dim=[-2, -1]) > 0
-        # pdb.set_trace()
-        # dist = F.cosine_similarity(prototypes_final[:,:,None,:], torch.cat([prototype_fg[:,None,:], prototype_bg], dim=1)[:,None,:,:], dim=-1)
-        # # dist = F.cosine_similarity(prototypes_final.flatten(0,1)[:,None,:], prototype_fg[None, :, :][:, :rois.shape[0]], dim=2).unflatten(0, prototypes_final.shape[:2]).squeeze(-1).squeeze(-1)
-        # # prototype_obj = dist.argmax(dim=-1)
-        # sim = sim.unflatten(-1, vit_feat.shape[-2:])
-        # sim = normalize_map(sim)
-        # sim = torch.where(sim > 0.7, sim, torch.zeros_like(sim))
-        # bg_down_sample = normalize_map(bg_down_sample)
-        # sim_obj_ratio = (sim * (fg_down_sample.unsqueeze(1) > 0.3)).sum(dim=[-2, -1]) / (sim.sum(dim=[-2, -1]))
-        # sim_upsample = F.interpolate(sim, scale_factor=16, mode='bilinear')
-        # sim_obj_ratio = (sim_upsample * (map_cos_bg>0.85).unsqueeze(1)).sum(dim=[-2, -1]) < (sim_upsample * ((map_cos_bg<0.5).unsqueeze(1))).sum(dim=[-2, -1])
-        # num_obj = rois.shape[0]
 
         return sim, sim_is_max
-        # TODO: 将各个prototype分配给物体
 
     def mean_shift_grid_prototype(self, maps, vit_feat, rois=None, thr=0.35, n_shift=5, output_size=(4,4), tau=0.1, temp=0.1, n_points=20):
         # TODO: debug
@@ -1754,113 +1516,9 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
             # sim = torch.cat(sims_objs)
         else:
             prototypes, sim = cosine_shift_self(prototypes[0], (vit_feat).flatten(-2).transpose(0,1).clone(), vit_feat.flatten(-2).transpose(0,1).clone(), tau=tau, n_shift=n_shift)
-
-        # pdb.set_trace()
-        # prototypes, bandwidth = merge_pototypes_bandwidth(prototypes.unflatten(0, select_coords.shape[:2]), bandwidth.unflatten(0, select_coords.shape[:2]))
-        # sim = gaussian(torch.abs(torch.cat(prototypes)[:, None, :] - vit_feat.flatten(-2).transpose(0,1).clone()[None, :, :]), torch.cat(bandwidth).unsqueeze(1))
-        # sim = sim.unflatten(-1, vit_feat.shape[-2:])
-        # split_size = [p.shape[0] for p in prototypes]
-        # sim = torch.split(sim, split_size, dim=0)
-
-        # prototypes = merge_pototypes(prototypes.unflatten(0, select_coords.shape[:2]))
-        # sim = F.softmax(sim, dim=-1)
         
         return prototypes, sim.unflatten(-1, vit_feat.shape[-2:]).clamp(0)
 
-
-    # def get_prototypes_bg(self, bg_map, fg_map, vit_feat, n_clusters=40):
-    #     max_val = bg_map.flatten(-2).max(dim=-1, keepdim=True)[0].unsqueeze(-1)
-    #     bg_mask = torch.where(bg_map > max_val*0.3, True, False).squeeze(1)
-    #     bg_mask[fg_map.squeeze(1)>0] = False
-    #     prot_bg = []
-    #     for i_obj in range(bg_mask.shape[0]):
-    #         mask = bg_mask[i_obj]
-    #         feats = vit_feat.permute(1,2,0)[mask]
-    #         cluster_ids_x, cluster_centers = kmeans(
-    #             X=feats, num_clusters=n_clusters, distance='cosine', device=vit_feat.device
-    #         )
-    #         prot_bg.append(cluster_centers)
-
-    #     return torch.stack(prot_bg)
-
-    # def get_mask_sample_points_roi_best_attn_feat_refine(self, 
-    #                                                     attn, 
-    #                                                     rois, 
-    #                                                     attn_idx, 
-    #                                                     vit_feat, 
-    #                                                     pos_thr=0.6, 
-    #                                                     neg_thr=0.6, 
-    #                                                     num_gt=20, 
-    #                                                     corr_size=21, 
-    #                                                     refine_times=2, 
-    #                                                     gt_points=None, 
-    #                                                     mean_shift_refine=False):
-    #     # Parameters:
-    #     #     attn: num_layers, num_points, H, W
-    #     #     roi: num_points, 4
-    #     # Return:
-    #     #     coords_chosen: num_points, num_gt, 2
-    #     #     labels_chosen: num_points, num_gt
-    #     num_points = attn.shape[1]
-    #     attn_map = attn.detach().clone()
-    #     attn_map = attn_map[attn_idx, torch.arange(num_points)] # num_points, num_pixels, 2
-    #     if mean_shift_refine:
-    #         map_cos_fg, map_cos_bg = get_cosine_similarity_refined_map(attn_map, 
-    #                                                                 vit_feat, 
-    #                                                                 rois, 
-    #                                                                 epoch=self.epoch, 
-    #                                                                 thr_pos=0.1, 
-    #                                                                 thr_neg=0.2, 
-    #                                                                 num_points=20, 
-    #                                                                 thr_fg=0.7,
-    #                                                                 refine_times=5, 
-    #                                                                 gt_points=gt_points)
-    #         fg_inter = F.interpolate(map_cos_fg[:, None, :, :], scale_factor=1/16, mode='bilinear')
-    #         bg_inter = F.interpolate(map_cos_bg[:, None, :, :], scale_factor=1/16, mode='bilinear')
-    #         for _ in range(5):
-    #             prototype_bg = self.get_prototypes_bg(bg_inter, fg_inter, vit_feat)
-    #             prototype_fg = (vit_feat * fg_inter).sum(dim=[-2,-1]) / (fg_inter.sum(dim=[-2,-1]) + 1e-8)
-    #             # prototype_bg = (vit_feat * bg_inter).sum(dim=[-2,-1]) / (bg_inter.sum(dim=[-2,-1]) + 1e-8)
-    #             # prototype_bg = (vit_feat * bg_inter).sum(dim=[-2,-1]) / (bg_inter.sum(dim=[-2,-1]) + 1e-8)
-    #             mean_shift_sim, mean_shift_dist  = self.mean_shift_refine_prototype(map_cos_fg, 
-    #                                                                     map_cos_bg, 
-    #                                                                     prototype_fg, 
-    #                                                                     prototype_bg, 
-    #                                                                     vit_feat,
-    #                                                                     rois,
-    #                                                                     n_shift=3)
-                
-    #         # mean_shift_sim = F.interpolate(mean_shift_sim, scale_factor=16, mode='bilinear')
-    #         # prototype_is_pos = mean_shift_dist.argmax(dim=-1) == 0
-    #         # prototype_is_pos = mean_shift_dist
-    #         # idx_prot = torch.arange(prototype_is_pos.shape[0], device=prototype_is_pos.device)[:, None].expand(-1, prototype_is_pos.shape[0]).flatten()
-    #     else:
-    #         map_cos_fg, map_cos_bg = get_cosine_similarity_refined_map(attn_map, vit_feat, rois, epoch=self.epoch, thr_pos=0.2, thr_neg=0.1, num_points=20, thr_fg=0.7, refine_times=5, gt_points=gt_points, return_feats=mean_shift_refine)
-        
-
-    #     coord_chosen = []
-    #     label_chosen = []
-    #     # num_objs = map_cos_fg[0].shape[0]
-    #     # for i_p, map_fg, map_bg in zip(range(num_objs), map_cos_fg[0], map_cos_bg[0]):
-    #     num_objs = map_cos_fg.shape[0]
-    #     for i_p, map_fg, map_bg in zip(range(num_objs), map_cos_fg, map_cos_bg):
-    #         # print(f'num_objs: {num_objs}')
-    #         # print(f'map_cos_fg.shape: {map_cos_fg.shape}')
-    #         # pdb.set_trace()
-    #         xmin, ymin, xmax, ymax = rois[i_p].int().tolist()
-    #         H, W = map_fg.shape[-2:]
-    #         map_crop_fg = map_fg[ymin:ymax, xmin:xmax]
-    #         map_crop_bg = map_bg[ymin:ymax, xmin:xmax]
-    #         coor, label = get_mask_points_single_box_cos_map_fg_bg(map_crop_fg, map_crop_bg, pos_thr=pos_thr, neg_thr=neg_thr, num_gt=num_gt,i=i_p, corr_size=corr_size)
-    #         coor[:, 0] += ymin
-    #         coor[:, 1] += xmin
-            
-    #         coor = coor.flip(1)
-    #         coord_chosen.append(coor)
-    #         label_chosen.append(label)
-    #     coords_chosen = torch.stack(coord_chosen).float()
-    #     labels_chosen= torch.stack(label_chosen)
-    #     return coords_chosen, labels_chosen, map_cos_fg, map_cos_bg, map_cos_fg, mean_shift_dist
 
     def get_mask_sample_points_roi_prots_best_attn_feat_refine(self, attn, rois, attn_idx, vit_feat, pos_thr=0.6, neg_thr=0.6, num_gt=20, corr_size=21, refine_times=2, obj_tau=0.85):
         # Parameters:
@@ -1939,25 +1597,16 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
         map_cos_fg_corr = corrosion_batch(torch.where(map_cos_fg>pos_thr, torch.ones_like(map_cos_fg), torch.zeros_like(map_cos_fg))[None], corr_size=11)[0]
         fg_inter = F.interpolate(map_cos_fg_corr.unsqueeze(0), vit_feat.shape[-2:], mode='bilinear')[0]
         bg_inter = F.interpolate(map_cos_bg.unsqueeze(0).max(dim=1, keepdim=True)[0], vit_feat.shape[-2:], mode='bilinear')[0]
-        # pca = PCA(n_components=self.pca_dim)
-        # pca.fit(vit_feat.flatten(1).permute(1, 0).cpu().numpy())
-        # vit_feat_pca = torch.from_numpy(pca.fit_transform(vit_feat.flatten(1).permute(1, 0).cpu().numpy())).to(vit_feat.device)
-        # vit_feat_pca = vit_feat_pca.permute(1, 0).unflatten(1, vit_feat.shape[-2:])
-
-        vit_feat_pca = vit_feat
         map_fg = torch.where(fg_inter > pos_thr, torch.ones_like(fg_inter), torch.zeros_like(fg_inter))
 
-        prototypes_fg, sim_fg = self.mean_shift_grid_prototype(map_fg, vit_feat_pca, rois, tau=0.1, temp=0.1, n_shift=refine_times)
+        prototypes_fg, sim_fg = self.mean_shift_grid_prototype(map_fg, vit_feat, rois, tau=0.1, temp=0.1, n_shift=refine_times)
 
         sim_fg, idx_pos = filter_maps(sim_fg.unflatten(0, (sim_fg.shape[0]//20, 20)), fg_inter, bg_inter)
         split_size = idx_pos.sum(dim=-1).tolist()
         prototypes_fg = merge_maps(prototypes_fg[idx_pos.flatten()].split(split_size, dim=0), thr=merge_thr)
-        sim_fg = [cal_similarity(prot, vit_feat_pca.permute(1,2,0)) for prot in prototypes_fg]
-        # coord_semantic_center, coord_semantic_center_split = get_center_coord(sim_fg, rois, gt_labels, num_max_obj=num_semantic_points)
-        # return coord_semantic_center, coord_semantic_center_split, sim_fg
+        sim_fg = [cal_similarity(prot, vit_feat.permute(1,2,0)) for prot in prototypes_fg]
         coord_semantic_center, coord_semantic_center_split, feat_semantic_center_split, feat_semantic_center, num_parts, coord_sc_org, label_sc_org, corres_gt  = get_center_coord_with_feat(sim_fg, rois, gt_labels, vit_feat, num_max_obj=num_semantic_points)
         return coord_semantic_center, coord_semantic_center_split, sim_fg, feat_semantic_center_split, feat_semantic_center, num_parts, coord_sc_org, label_sc_org, corres_gt
-
 
     def get_mask_sample_points_roi_best_attn_local_global(self, 
                                                         attn, 
@@ -2003,15 +1652,9 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
                               torch.where((bg_inter > 0.35) & (fg_inter < 0.1), torch.ones_like(bg_inter), torch.zeros_like(bg_inter))))
         map_fg = torch.where(fg_inter > 0.35, torch.ones_like(fg_inter), torch.zeros_like(fg_inter))
 
-        # print(f'map_fgbg.shape: {map_fgbg.shape}')
-        # pdb.set_trace()
+
         prototypes_fg, sim_fg = self.mean_shift_grid_prototype(map_fg, vit_feat_pca, rois, tau=0.1, temp=1, n_shift=20)
 
-        # prototypes_fg, sim_fg = self.mean_shift_grid_prototype(torch.where(fg_inter > 0.35, torch.ones_like(fg_inter), torch.zeros_like(fg_inter)),
-        #                                 vit_feat_pca,
-        #                                 rois,
-        #                                 tau=25,
-        #                                 n_shift=20)
         bg_filter = torch.where((bg_inter > 0.35) & (fg_inter < 0.1), torch.ones_like(bg_inter), torch.zeros_like(bg_inter))
         bg_filter = torch.sum(bg_filter, dim=0, keepdim=True).clamp(0,1)
         fg_mask = fg_inter.sum(dim=0, keepdim=True).clamp(0,1)
@@ -2282,10 +1925,7 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
             pseudo_gt_masks.append(torch.where(map_cos_fg[-1] > map_cos_fg[-1].flatten(1).max(1)[0][:, None, None] * pos_mask_thr, 
                                               torch.ones_like(map_cos_fg[-1]), 
                                               torch.zeros_like(map_cos_fg[-1])).to(torch.uint8).detach().cpu().numpy())
-        # pseudo_gt_mask, ignore_mask = self.get_pseudo_gt_masks_from_point_attn(cam_maps_images, gt_box_index)
-        
-        # points_attn_maps_images: list, length=#Imgs, points_attn_maps_images[i].shape: [n_layers, n_gts_i, H, W]
-        # gt_box_index: tuple, length=#Imgs, gt_box_index[i]: [#gts_i, ]
+
         if self.visualize:
             self.semantic_centers_split = semantic_centers_split_ret
             self.attns = attns
@@ -2557,25 +2197,8 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
                                                     img_metas, img=img)
             losses.update(bbox_results['loss_bbox'])
         
-        if self.with_reppoints_head:
-            reppoint_loss, semantic_centers_split_new = self.reppoints_head.forward_train(
-                [xx.clone().detach() for xx in x], gt_bboxes, semantic_centers_org[0], img_metas, num_parts, gt_masks,
-                fg_maps=map_cos_fg, gt_labels=gt_labels)
-
-            if self.with_deform_sup:
-                semantic_centers_split = semantic_centers_split_new
-            #     # import copy
-            #     # semantic_centers_copy = copy.deepcopy(semantic_centers_split_new)
-            #     # semantic_centers_split = random_select_half(semantic_centers_split_new)
-            # losses.update(reppoint_loss)
-            # reppoint_loss = self.reppoints_head.forward_train(
-            #     [xx.clone().detach() for xx in x], gt_bboxes, semantic_centers_org[0], img_metas, num_parts, gt_masks,
-            #     fg_maps=map_cos_fg, gt_labels=gt_labels)
-            losses.update(reppoint_loss)
-
         # mask head forward and loss
         if self.with_mask:
-            # gt_masks_pseudo = self.get_pseudo_gt_masks_from_point_attn()
             mask_results = self._mask_forward_train(x, sampling_results,
                                                     bbox_results['bbox_feats'],
                                                     mask_point_coords, mask_point_labels,
@@ -2624,14 +2247,6 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
                 if self.with_bbox_rec:
                     assert True
                 else:
-#                     if len(bbox_feats) == 0:
-# #                         bbox_feats = extractor(x[:extractor.num_inputs], rois[-1:])
-# #                         cls_score, bbox_pred = head(bbox_feats) # 随机选择一个反例训练
-#                         num_classes = head.num_classes
-#                         out_dim_reg = 4 if head.reg_class_agnostic else 4 * num_classes
-#                         cls_score = torch.empty((0, num_classes + 1), dtype=torch.float16).to(bbox_feats.device)
-#                         bbox_pred = torch.empty((0, out_dim_reg), dtype=torch.float16).to(bbox_feats.device)
-#                     else:
                     cls_score, bbox_pred = head(bbox_feats)
                     
                     cls_scores.append(cls_score)
@@ -2742,45 +2357,6 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
 
         return bbox_results
 
-#     def _mask_forward_train(self, x, sampling_results, bbox_feats, gt_masks,
-#                             img_metas, ignore_mask=None):
-#         """Run forward function and calculate loss for mask head in
-#         training."""
-#         weight = None
-#         if not self.share_roi_extractor:
-#             pos_rois = bbox2roi([res.pos_bboxes for res in sampling_results])
-#             mask_results = self._mask_forward(x, pos_rois)
-#         else:
-#             pos_inds = []
-#             device = bbox_feats.device
-#             for res in sampling_results:
-#                 pos_inds.append(
-#                     torch.ones(
-#                         res.pos_bboxes.shape[0],
-#                         device=device,
-#                         dtype=torch.uint8))
-#                 pos_inds.append(
-#                     torch.zeros(
-#                         res.neg_bboxes.shape[0],
-#                         device=device,
-#                         dtype=torch.uint8))
-#             pos_inds = torch.cat(pos_inds)
-
-#             mask_results = self._mask_forward(
-#                 x, pos_inds=pos_inds, bbox_feats=bbox_feats)
-#         mask_targets = self.mask_head.get_targets(sampling_results, gt_masks,
-#                                                   self.train_cfg)
-#         if ignore_mask is not None:
-#             weight = self.mask_head.get_targets(sampling_results, ignore_mask,
-#                                                   self.train_cfg)
-
-#         pos_labels = torch.cat([res.pos_gt_labels for res in sampling_results])
-#         loss_mask = self.mask_head.loss(mask_results['mask_pred'],
-#                                         mask_targets, pos_labels, weight=weight)
-
-#         mask_results.update(loss_mask=loss_mask, mask_targets=mask_targets)
-#         return mask_results
-
     def _mask_forward(self, x, rois=None, pos_inds=None, bbox_feats=None):
         """Mask head forward function used in both training and testing."""
         assert ((rois is not None) ^
@@ -2796,23 +2372,6 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
         mask_pred = self.mask_head(mask_feats)
         mask_results = dict(mask_pred=mask_pred, mask_feats=mask_feats)
         return mask_results
-
-#     def _mask_forward(self, x, rois=None, pos_inds=None, bbox_feats=None):
-#         """Mask head forward function used in both training and testing."""
-#         assert (rois is not None) ^ (pos_inds is not None and bbox_feats is not None)
-#         if rois is not None:
-#             mask_feats = self.mask_roi_extractor(
-#                 x[: self.mask_roi_extractor.num_inputs], rois
-#             )
-#             if self.with_shared_head:
-#                 mask_feats = self.shared_head(mask_feats)
-#         else:
-#             assert bbox_feats is not None
-#             mask_feats = bbox_feats # 适应MAE的decoder的特性，所有的特征都输入到decoder中，只是返回的时候用pos_inds
-
-#         mask_pred = self.mask_head(mask_feats)
-#         mask_results = dict(mask_pred=mask_pred[pos_inds], mask_feats=mask_feats)
-#         return mask_results
 
     def _mask_forward_train(
         self, x, sampling_results, bbox_feats, points_coords, points_labels, img_metas=None, semantic_centers=None, **kwargs
@@ -2845,11 +2404,6 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
         )
         pos_labels = torch.cat([res.pos_gt_labels for res in sampling_results])
 
-        # assert points_labels[0].shape[1] == 5
-        # assert sites_img[0].shape[2] == 5
-        # res=sampling_results[1]
-        # res.pos_gt_labels
-        # try:
         pos_bboxes = torch.cat([res.pos_bboxes for res in sampling_results])
         sites = torch.cat(
             [
@@ -2884,8 +2438,6 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
 
         mask_results.update(loss_mask=loss_mask)  # , mask_targets=mask_targets)
         return mask_results
-        # except Exception as e:
-        #     print("error in _mask_forward_train: ", e)
 
     async def async_simple_test(self,
                                 x,
@@ -3069,10 +2621,6 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
             labels[pos_inds] = pos_gt_labels
             pos_weight = 1.0 if cfg.point_pos_weight <= 0 else cfg.point_pos_weight
             label_weights[pos_inds] = pos_weight
-#             if not self.reg_decoded_bbox:
-#                 pos_bbox_targets = self.bbox_coder.encode(
-#                     pos_bboxes, pos_gt_bboxes)
-#             else:
             pos_bbox_targets = pos_gt_bboxes 
             bbox_targets[pos_inds, :] = pos_bbox_targets
             bbox_weights[pos_inds, :] = 1
@@ -3197,7 +2745,7 @@ class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMix
                 dict[str, Tensor]: Dictionary of loss components
         """
         losses = dict()
-        bg_class_ind = self.bbox_head.num_classes 
+        bg_class_ind = self.bbox_head.num_classes
         # note in spare rcnn num_gt == num_pos
         pos_inds = (labels >= 0) & (labels < bg_class_ind)
         num_pos = pos_inds.sum().float()

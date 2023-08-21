@@ -1,0 +1,66 @@
+Metadata-Version: 2.1
+Name: mmdet
+Version: 2.11.0
+Summary: OpenMMLab Detection Toolbox and Benchmark
+Home-page: https://github.com/open-mmlab/mmdetection
+Author: OpenMMLab
+Author-email: openmmlab@gmail.com
+License: Apache License 2.0
+Keywords: computer vision,object detection
+Platform: UNKNOWN
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.6
+Classifier: Programming Language :: Python :: 3.7
+Classifier: Programming Language :: Python :: 3.8
+Description-Content-Type: text/markdown
+Provides-Extra: all
+Provides-Extra: tests
+Provides-Extra: build
+Provides-Extra: optional
+License-File: LICENSE
+
+# MAE pretrained VIT for Object Detection 
+
+# MAE pretrained link
+```
+wget https://dl.fbaipublicfiles.com/mae/pretrain/mae_pretrain_vit_base.pth
+```
+
+### Installation
+
+Just run the install.sh
+
+### Training
+
+To train a detector with pre-trained models, run:
+Just run the run_train.sh
+
+**Note:** `use_checkpoint` is used to save GPU memory. Please refer to [this page](https://pytorch.org/docs/stable/checkpoint.html) for more details.
+
+
+### Apex (optional):
+We use apex for mixed precision training by default. To install apex, run:
+```
+git clone https://github.com/NVIDIA/apex
+cd apex
+pip install -v --disable-pip-version-check --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./
+```
+If you would like to disable apex, modify the type of runner as `EpochBasedRunner` and comment out the following code block in the [configuration files](configs/swin):
+```
+# do not use mmdet version fp16
+fp16 = None
+optimizer_config = dict(
+    type="DistOptimizerHook",
+    update_interval=1,
+    grad_clip=None,
+    coalesce=True,
+    bucket_size_mb=-1,
+    use_fp16=True,
+)
+```
+
+
+
