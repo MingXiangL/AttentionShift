@@ -1,5 +1,5 @@
 import torch
-
+import os
 import numpy as np
 from mmdet.core import bbox2result, bbox2roi, build_assigner, build_sampler
 from ..builder import HEADS, build_head, build_roi_extractor, build_shared_head
@@ -22,7 +22,40 @@ import time
 import random
 from cc_torch import connected_components_labeling
 from ..utils import ObjectQueues, ObjectFactory, cosine_distance, cosine_distance_part
+import matplotlib.pyplot as plt
 
+
+def extract_bg_coords(A, num_groups=3, num_points_per_group=5):
+    # 找出 A 中非零的点
+    device = A.device
+    non_zero_indices = torch.nonzero(A)
+    max_points = num_groups * num_points_per_group
+    
+    
+    # 如果 A 中没有非零的点，我们可以从 B 中随机选择点
+    if non_zero_indices.size(0) == 0:
+        indices = torch.ones(num_groups*num_points_per_group, 2, device=device, dtype=non_zero_indices.dtype)
+    else:   
+        num_samples = min(max_points, non_zero_indices.size(0))
+        perm = torch.randperm(non_zero_indices.size(0))
+        indices = non_zero_indices[perm[:num_samples]]
+
+        # 如果非零点的数量小于max_points，我们将重复indices直到其长度达到max_points
+        while indices.size(0) < max_points:
+            indices = torch.cat((indices, non_zero_indices[perm[:max_points - indices.size(0)]]))
+    coords = (indices.float() + 0.5)
+    map_size = coords.new_tensor(A.shape[:2])
+    coords = (coords / map_size).flip(0)
+    return coords.reshape(num_groups, -1, 2)
+
+# from torchpq.clustering import MultiKMeans
+def random_select_half(point_list_img):
+    for i_img in range(len(point_list_img)):
+        for i_obj in range(len(point_list_img[i_img])):
+            N = point_list_img[i_img][i_obj].shape[0]
+            idx = random.sample(range(N) , N//2)
+            point_list_img[i_img][i_obj] = point_list_img[i_img][i_obj][idx]
+    return point_list_img
 
 def get_bbox_from_cam_fast(cam, point, cam_thr=0.2, area_ratio=0.5, 
                       img_size=None, box_method='expand', erode=False):
@@ -671,7 +704,48 @@ def get_refined_similarity(point_coords, feats, bboxes, ratio=1, refine_times=1,
         else:
             cos_rf.append(cos_map1.clone())
 
-    return torch.stack(cos_rf)
+    return torch.stack(cos_rf), feats_mask
+
+
+def get_refined_similarity_input_map(cos_map, feats, bboxes, refine_times=1, tau=0.85, is_select=False):
+    # fg_map = cos_map.argmax(dim=0, keepdim=True)  < bboxes.shape[0]
+    # cos_map *= fg_map
+    cos_map1 = cos_map.clone()
+    cos_rf = []
+    bbox_mask = box2mask(bboxes//16, cos_map.shape[-2:], default_val=0)
+    # cos_map[:bboxes.shape[0]] = cos_map[:bboxes.shape[0]] * bbox_mask
+    if is_select:
+        # cos_map_select = torch.where(idx_max_aff==range_obj[:,None,None], cos_map, torch.zeros_like(cos_map))
+        cos_map[:bboxes.shape[0]] = cos_map[:bboxes.shape[0]] * bbox_mask
+        # max_val = cos_map.flatten(1).max(1, keepdim=True)[0].unsqueeze(-1)
+        # cos_map = cos_map / (max_val + 1e-8)
+        idx_max_aff = cos_map.argmax(0, keepdim=True).expand_as(cos_map)
+        range_obj = torch.arange(cos_map.shape[0], device=cos_map.device)
+        cos_rf.append(torch.where(idx_max_aff==range_obj[:,None,None], cos_map.clone(), torch.zeros_like(cos_map)))
+    else:
+        cos_rf.append(cos_map.clone())
+
+    for i in range(refine_times):
+        # fg_map = cos_map1.argmax(dim=0, keepdim=True)  < bboxes.shape[0]
+        # cos_map1 *= fg_map
+        # cos_map1[:bboxes.shape[0]] = bbox_mask * cos_map1[:bboxes.shape[0]]
+        max_val = cos_map1.flatten(1).max(1, keepdim=True)[0].unsqueeze(-1)
+        thr = max_val * tau
+        cos_map1[cos_map1 < thr] *= 0
+        feats_mask = feats * cos_map1.unsqueeze(1)
+        feats_mask = feats_mask.sum([2,3], keepdim=True) / (cos_map1.unsqueeze(1).sum([2,3], keepdim=True).clamp(1e-8))
+        cos_map1 = F.cosine_similarity(feats, feats_mask, dim=1)
+        if is_select:
+            # cos_map_select = torch.where(idx_max_aff==range_obj[:,None,None], cos_map1, torch.zeros_like(cos_map1))
+            # cos_map1[:bboxes.shape[0]] = bbox_mask * cos_map1[:bboxes.shape[0]]
+            cos_map1[:bboxes.shape[0]] = cos_map1[:bboxes.shape[0]] * bbox_mask
+            idx_max_aff = cos_map1.argmax(0, keepdim=True).expand_as(cos_map1)
+            range_obj = torch.arange(cos_map1.shape[0], device=cos_map1.device)
+            cos_rf.append(torch.where(idx_max_aff==range_obj[:,None,None], cos_map1.clone(), torch.zeros_like(cos_map1)))
+        else:
+            cos_rf.append(cos_map1.clone())
+
+    return torch.stack(cos_rf), feats_mask
 
 
 def distance_batch(a, b):
@@ -931,8 +1005,10 @@ def get_cosine_similarity_refined_map(attn_maps, vit_feat, bboxes, thr_pos=0.2, 
     points_bg_supp = sample_point_grid(attn_norm.mean(0, keepdim=True), thr=thr_neg, num_points=num_points)
     # points_bg_supp = torch.cat([sample_point_grid(attn_norm[0].mean(0,keepdim=True)<thr_neg, num_points=num_points) for _ in range(3)],dim=0)
     points_fg = torch.cat((points_fg, points_bg_supp), dim=0)
-    cos_sim_fg = F.interpolate(get_refined_similarity(points_fg, vit_feat[None], bboxes=bboxes, refine_times=refine_times, tau=obj_tau, is_select=True), attn_maps.shape[-2:], mode='bilinear')[:,:attn_norm.shape[0]]
-    cos_sim_bg = F.interpolate(get_refined_similarity(points_bg, vit_feat[None], bboxes=bboxes, refine_times=refine_times, tau=obj_tau), attn_maps.shape[-2:], mode='bilinear')
+    cos_sim_fg, fg_feat = get_refined_similarity(points_fg, vit_feat[None], bboxes=bboxes, refine_times=refine_times, tau=obj_tau, is_select=True)
+    cos_sim_bg, bg_feat = get_refined_similarity(points_bg, vit_feat[None], bboxes=bboxes, refine_times=refine_times, tau=obj_tau)
+    cos_sim_fg = F.interpolate(cos_sim_fg, attn_maps.shape[-2:], mode='bilinear')[:,:attn_norm.shape[0]]
+    cos_sim_bg = F.interpolate(cos_sim_bg, attn_maps.shape[-2:], mode='bilinear')
     ret_map = (1 - cos_sim_bg) * cos_sim_fg
     map_val = ret_map.flatten(-2, -1).max(-1, keepdim=True)[0].unsqueeze(-1).clamp(1e-8)
     
@@ -940,7 +1016,7 @@ def get_cosine_similarity_refined_map(attn_maps, vit_feat, bboxes, thr_pos=0.2, 
     max_val_bg = cos_sim_bg.flatten(-2, -1).max(-1, keepdim=True)[0].unsqueeze(-1).clamp(1e-8)
 #    map_fg = torch.where(ret_map < map_val * thr_fg, torch.zeros_like(ret_map), torch.ones_like(ret_map))
     # map_bg = torch.where(ret_map > map_val * 0.1, torch.zeros_like(ret_map), torch.ones_like(ret_map))
-    return ret_map / map_val, cos_sim_bg / max_val_bg, points_fg, points_bg
+    return ret_map / map_val, cos_sim_bg / max_val_bg, points_fg, points_bg, fg_feat, bg_feat
 
 def get_cos_similarity_map(point_coords, point_labels, feats, ratio=1):
     feat_expand = feats.permute(0,2,3,1).expand(point_coords.shape[0], -1, -1, -1)
@@ -1195,9 +1271,59 @@ def attns_project_to_feature(attns_maps):
     reverse_joint_attentions = reverse_joint_attentions.permute(1, 0, 2, 3)
     return reverse_joint_attentions
 
+# def attns_project_to_feature(attns_maps):
+#     #         assert len(attns_maps[1]) == 1 
+#     # [block_num], B, H, all_num, all_num
+#     attns_maps = torch.stack(attns_maps)
+#     # block_num, B, H, all_num, all_num
+# #     attns_maps = attns_maps.mean(2)
+#     # block_num, B, all_num, all_num
+#     residual_att = torch.eye(attns_maps.size(2)).type_as(attns_maps)
+#     aug_att_mat = attns_maps + residual_att
+#     aug_att_mat = aug_att_mat / aug_att_mat.sum(-1).unsqueeze(-1)
+
+#     joint_attentions = torch.zeros(aug_att_mat.size()).type_as(aug_att_mat)
+#     joint_attentions[0] = aug_att_mat[0]
+
+#     for n in range(1, aug_att_mat.size(0)):
+#         joint_attentions[n] = torch.matmul(aug_att_mat[n], joint_attentions[n - 1])
+#     attn_proj_map = joint_attentions[-1]
+# #     return joint_attentions
+#     return attn_proj_map
+
+# def attns_project_to_feature(attns_maps, num_proposals=None, cam_layers=None, patch_size=None, pos_inds=None):
+#     patch_h, patch_w = patch_size
+# #     # [block_num], B, H, all_num, all_num
+#     attns_maps = torch.stack(attns_maps).detach()
+#     # block_num, B, H, all_num, all_num
+#     attns_maps = attns_maps.mean(2)
+#     # block_num, B, all_num, all_num
+#     point_token_attn_maps = []
+#     for layer in cam_layers:
+#         attns_maps_ = attns_maps[layer:]
+#         residual_att = torch.eye(attns_maps_.size(2)).type_as(attns_maps_)
+#         aug_att_mat = attns_maps_ + residual_att
+#         aug_att_mat = aug_att_mat / aug_att_mat.sum(-1).unsqueeze(-1)
+
+#         joint_attentions = torch.zeros(aug_att_mat.size()).type_as(aug_att_mat)
+#         joint_attentions[0] = aug_att_mat[0]
+
+#         for n in range(1, aug_att_mat.size(0)):
+#             joint_attentions[n] = torch.matmul(aug_att_mat[n], joint_attentions[n - 1])
+#         attn_proj_map = joint_attentions[-1][-num_proposals:, 1:-num_proposals]
+#         attn_proj_map = attn_proj_map.reshape(-1, 1, patch_h, patch_w)
+#         attn_proj_map = F.interpolate(attn_proj_map, (patch_h * 16, patch_w * 16), 
+#                                       mode='bilinear').reshape(-1, patch_h * 16, patch_w * 16).cpu().numpy() # 100, H, W
+#         point_token_attn_maps.append(attn_proj_map)
+#         print(attn_proj_map.size())
+# #     point_token_attn_maps = torch.stack(point_token_attn_maps, dim=0)
+# #     print(point_token_attn_maps.size())
+#     exit()
+# #     return joint_attentions
+#     return attn_proj_map
 
 @HEADS.register_module()
-class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
+class StandardRoIHeadMaskPointSampleDeformAttnReppoints(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
     """Simplest base roi head including one bbox head and one mask head."""
 
     def __init__(self,
@@ -1218,6 +1344,8 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
                  semantic_to_token=False,
                  pca_dim=128,
                  mean_shift_times_local=10,
+                 reppoints_head=None,
+                 num_reppoints_head=1,
                  ):
         super().__init__()
         self.train_cfg = train_cfg
@@ -1242,6 +1370,15 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
             self.with_mae_head = True
         else:
             self.with_mae_head = False
+
+        if reppoints_head is not None:
+            if not isinstance(reppoints_head, list):
+                reppoints_head = [reppoints_head]
+            self.num_reppoints_head = len(reppoints_head)
+            self.reppoints_head = nn.ModuleList([build_head(head) for head in reppoints_head])
+            self.with_reppoints_head = True
+        else:
+            self.with_reppoints_head = False
             
         self.visualize = visualize
         self.epoch_semantic_centers = epoch_semantic_centers
@@ -1353,6 +1490,103 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
             outs = outs + (mask_results['mask_pred'], )
         return outs
 
+    def point2bbox(self,
+                   x,
+                   img_metas,
+                   proposal_list,
+                   gt_bboxes,
+                   gt_labels,
+                   gt_bboxes_ignore=None,
+                   gt_masks=None,
+                   vit_feat=None,
+                   img=None,
+                   point_init=None,
+                   point_cls=None,
+                   point_reg=None,
+                   imgs_whwh=None,
+                   attns=None,
+                   scale_factor=None,
+                  ):
+        patch_h, patch_w = x[2].size(-2), x[2].size(-1)
+        num_proposals = point_cls.size(1)
+        # attention maps
+        joint_attentions = attns_project_to_feature(attns[self.bbox_head.cam_layer:])
+#         cams = joint_attentions[-1][:, -num_proposals:, 1:-num_proposals].reshape(-1, num_proposals, patch_h, patch_w)
+        cams = joint_attentions[:, -num_proposals:, 1:-num_proposals].reshape(-1, num_proposals, patch_h, patch_w)
+        cams = F.interpolate(cams, (patch_h * 16, patch_w * 16), mode='bilinear')
+        # seed proposal
+        scores = point_cls.sigmoid()  # 获得proposal的真实得分
+        scores, label_inds = scores.max(-1)  # 获得proposal label
+        points_locations = imgs_whwh * point_reg  # 获得最终点的位置
+
+#         pseudo_gt_scores = []
+        pseudo_gt_labels = []
+        pseudo_gt_bboxes = []
+        
+        for scores_per_img, pseudo_labels_per_img, point_locations_per_img, cam_per_img in zip(scores, label_inds, points_locations, cams):
+            pseudo_inds = scores_per_img >= self.bbox_head.seed_score_thr
+#             print(self.bbox_head.seed_score_thr, self.bbox_head.cam_layer)
+            if sum(pseudo_inds) == 0:
+                pseudo_gt_bboxes.append(torch.empty(0, 5))
+                pseudo_gt_labels.append(torch.empty(0))
+                continue
+            
+            pseudo_scores = scores_per_img[pseudo_inds]
+
+            pseudo_labels = pseudo_labels_per_img[pseudo_inds]
+            pseudo_labels_per_img = pseudo_labels.to(point_cls.device).long()
+            
+            pseudo_point_locations = point_locations_per_img[pseudo_inds]
+            pseudo_gt_bboxes_per_img = []
+            cam_ = cam_per_img[pseudo_inds]
+            
+            cam_ = cam_.detach().cpu().numpy()
+            pseudo_point_locations = pseudo_point_locations.detach().cpu().numpy()
+            for c, p in zip(cam_, pseudo_point_locations):
+                c = (c - c.min()) / (c.max() - c.min())
+                pseudo_gt_bbox = get_multi_bboxes(c,
+                                                  p,
+                                                  cam_thr=self.bbox_head.seed_thr, 
+                                                  area_ratio=self.bbox_head.seed_multiple)
+                pseudo_gt_bbox = torch.as_tensor(pseudo_gt_bbox, dtype=pseudo_point_locations.dtype, device=point_cls.device)
+                pseudo_gt_bboxes_per_img.append(pseudo_gt_bbox)
+            pseudo_gt_bboxes_per_img = torch.cat(pseudo_gt_bboxes_per_img, dim=0)
+            
+            del cam_
+            del pseudo_point_locations
+            
+            if not isinstance(scale_factor, tuple):
+                scale_factor = tuple([scale_factor])
+            # B, 1, bboxes.size(-1)
+            scale_factor = pseudo_gt_bboxes_per_img.new_tensor(scale_factor)
+            pseudo_gt_bboxes_per_img /= scale_factor
+            
+            pseudo_gt_bboxes_per_img = torch.cat([pseudo_gt_bboxes_per_img, pseudo_scores.unsqueeze(-1)], dim=1)
+#             pseudo_gt_scores.append(pseudo_scores)
+            pseudo_gt_bboxes.append(pseudo_gt_bboxes_per_img)
+            pseudo_gt_labels.append(pseudo_labels_per_img)
+            
+        return pseudo_gt_bboxes, pseudo_gt_labels
+
+    def transfer_to_cam(self, attn_maps):
+        n_layer, n_gt, h, w = attn_maps.shape
+        if torch.numel(attn_maps) == 0:
+            return torch.zeros(n_layer, 0, h, w, device=attn_maps.device), torch.zeros(n_layer, 0, h, w, device=attn_maps.device)
+
+        max_val, _ = attn_maps.flatten(-2).max(dim=-1, keepdim=True)
+        min_val, _ = attn_maps.flatten(-2).min(dim=-1, keepdim=True)
+        max_val = max_val.unsqueeze(-1)
+        min_val = min_val.unsqueeze(-1)
+        attn_maps_cam = (attn_maps  - min_val) / (max_val - min_val)
+        pos_idx = attn_maps_cam >= 0.2
+        ignore_idx = (attn_maps_cam < 0.2) & (attn_maps_cam > 0.1)
+        cams = torch.zeros_like(attn_maps_cam)
+        ignore_mask = torch.zeros_like(attn_maps_cam)
+        ignore_mask[ignore_idx] = 1.
+        cams[pos_idx] = 1.
+        
+        return cams, ignore_mask
+
     def get_map_coords(self, h, w, device, dtype):
         range_h = torch.arange(h, device=device, dtype=dtype)
         range_w = torch.arange(w, device=device, dtype=dtype)
@@ -1382,6 +1616,50 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
         labels_chosen= torch.stack(label_chosen)
         return coords_chosen, labels_chosen
         
+#     def get_mask_points_single_instance(self, coords, attn_map, cls_p, pos_thr=0.1, neg_thr=0.01, num_gt=10):
+#         # Parameters:
+#         #     coords: num_pixels, 2
+#         #     attn:H, W
+#         #     cls: scalar,
+#         # Return:
+#         #     coords_chosen: num_gt, 2
+#         #     labels_chosen: num_gt
+#         attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min())
+#         idx_pos = (attn_map > pos_thr).nonzero(as_tuple=False)
+#         idx_neg = (attn_map < neg_thr).nonzero(as_tuple=False)
+#         num_pos_tot = idx_pos.shape[0]
+#         pos_neg_idx = torch.cat([idx_pos, idx_neg], dim=0)
+#         num_anno = pos_neg_idx.shape[0]
+#         idx_shuffle = np.arange(num_anno)
+#         np.random.shuffle(idx_shuffle)
+#         idx_shuffle_topk = torch.from_numpy(idx_shuffle[:num_gt]).to(attn_map.device)
+#         idx_chosen = pos_neg_idx[idx_shuffle_topk]
+#         coords_chosen = coords[idx_chosen[:,0], idx_chosen[:,1]]
+
+#         # TODO: 这里面正例点的数量远远大于反例点的数量，是否需要调节阈值？
+#         labels_chosen = (idx_shuffle_topk < num_pos_tot)
+#         return coords_chosen, labels_chosen
+    # def get_mask_points_single_instance(self, coords, attn_map, cls_p, pos_thr=0.1, neg_thr=0.01, num_gt=10,i=0):
+    #     # Parameters:
+    #     #     coords: num_pixels, 2
+    #     #     attn:H, W
+    #     #     cls: scalar,
+    #     # Return:
+    #     #     coords_chosen: num_gt, 2
+    #     #     labels_chosen: num_gt
+    #     device = attn_map.device
+    #     attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min())
+    #     coord_pos = (attn_map > pos_thr).nonzero(as_tuple=False)
+    #     coord_neg = (attn_map < neg_thr).nonzero(as_tuple=False)
+    #     idx_chosen_pos = torch.randperm(coord_pos.shape[0], device=attn_map.device)[:num_gt//2]
+    #     idx_chosen_neg = torch.randperm(coord_neg.shape[0], device=attn_map.device)[:num_gt//2]
+    #     coords_chosen_pos = coord_pos[idx_chosen_pos]
+    #     coords_chosen_neg = coord_neg[idx_chosen_neg]
+    #     coords_chosen = torch.cat([coords_chosen_pos, coords_chosen_neg], dim=0)
+    #     labels_chosen = torch.cat((torch.ones(coords_chosen_pos.shape[0], device=device, dtype=torch.bool),
+    #                                 torch.zeros(coords_chosen_neg.shape[0], device=device, dtype=torch.bool)), dim=0)
+    #     return coords_chosen, labels_chosen
+
     def get_mask_sample_points_roi(self, attn, rois, pos_thr=0.2, neg_thr=0.5, num_gt=20, corr_size=21):
         # Parameters:
         #     attn: num_layers, num_points, H, W
@@ -1434,8 +1712,19 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
         return coords_chosen, labels_chosen
 
     def mean_shift_refine_prototype(self, map_cos_fg, map_cos_bg, prototype_fg, prototype_bg, vit_feat, rois, n_shift=5, output_size=(4,4), tau=0.1):
+        # print(f'map_cos_fg.shape: {map_cos_fg.shape}')
+        # print(f'map_cos_bg.shape: {map_cos_bg.shape}')
+        # print(f'prototype_fg.shape: {prototype_fg.shape}')
+        # print(f'prototype_bg.shape: {prototype_bg.shape}')
+        # print(f'vit_feat.shape: {vit_feat.shape}')
+        # print(f'rois.shape: {rois.shape}')
+        # objectness = F.interpolate((map_cos_fg - map_cos_bg).unsqueeze(0), scale_factor=1/16.0, mode='bilinear')[0]
+        # fg_down_sample = F.interpolate(map_cos_fg.unsqueeze(0), scale_factor=1/16.0, mode='bilinear')[0]
+        # bg_down_sample = F.interpolate(map_cos_bg.unsqueeze(0), scale_factor=1/16.0, mode='bilinear')[0]
         objectness = F.interpolate(map_cos_fg.unsqueeze(0), scale_factor=1/16.0, mode='bilinear')[0]
         uncertainty = 3 - F.interpolate(torch.abs(map_cos_fg - map_cos_bg).unsqueeze(0), scale_factor=1/16.0, mode='bilinear')[0]
+        # TODO: debug
+        # get prototypes of earch instance
         prototypes = []
         for box, uc, ob in zip((rois/16).long().tolist(), uncertainty, objectness):
             xmin, ymin, xmax, ymax = box
@@ -1462,8 +1751,29 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
             
             # prototypes.append(torch.cat([prototype_easy, prototype_hard], dim=0))
         prototypes = torch.stack(prototypes)
+        # sim = cosine_shift_self(vit_feat.flatten(-2).transpose(0,1).clone(), 
+        #                                         vit_feat.flatten(-2).transpose(0,1).clone(), tau=tau, n_shift=n_shift)
+        # sim = sim.unflatten(0, vit_feat.shape[-2:])
+        # max_sim = sim.max(dim=-1, keepdim=True)[0]
+        # sim_is_max = sim == max_sim
+        # sim_is_max = sim_is_max.unflatten(-1, vit_feat.shape[-2:])
+        # sim_is_max = sim_is_max[None,:,:,:,:] * (objectness>0.1)[:,None,None,:,:]
+        # sim_is_max = sim_is_max.sum(dim=[-2, -1]) > 0
+        # pdb.set_trace()
+        # dist = F.cosine_similarity(prototypes_final[:,:,None,:], torch.cat([prototype_fg[:,None,:], prototype_bg], dim=1)[:,None,:,:], dim=-1)
+        # # dist = F.cosine_similarity(prototypes_final.flatten(0,1)[:,None,:], prototype_fg[None, :, :][:, :rois.shape[0]], dim=2).unflatten(0, prototypes_final.shape[:2]).squeeze(-1).squeeze(-1)
+        # # prototype_obj = dist.argmax(dim=-1)
+        # sim = sim.unflatten(-1, vit_feat.shape[-2:])
+        # sim = normalize_map(sim)
+        # sim = torch.where(sim > 0.7, sim, torch.zeros_like(sim))
+        # bg_down_sample = normalize_map(bg_down_sample)
+        # sim_obj_ratio = (sim * (fg_down_sample.unsqueeze(1) > 0.3)).sum(dim=[-2, -1]) / (sim.sum(dim=[-2, -1]))
+        # sim_upsample = F.interpolate(sim, scale_factor=16, mode='bilinear')
+        # sim_obj_ratio = (sim_upsample * (map_cos_bg>0.85).unsqueeze(1)).sum(dim=[-2, -1]) < (sim_upsample * ((map_cos_bg<0.5).unsqueeze(1))).sum(dim=[-2, -1])
+        # num_obj = rois.shape[0]
 
         return sim, sim_is_max
+        # TODO: 将各个prototype分配给物体
 
     def mean_shift_grid_prototype(self, maps, vit_feat, rois=None, thr=0.35, n_shift=5, output_size=(4,4), tau=0.1, temp=0.1, n_points=20):
         # TODO: debug
@@ -1516,9 +1826,113 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
             # sim = torch.cat(sims_objs)
         else:
             prototypes, sim = cosine_shift_self(prototypes[0], (vit_feat).flatten(-2).transpose(0,1).clone(), vit_feat.flatten(-2).transpose(0,1).clone(), tau=tau, n_shift=n_shift)
+
+        # pdb.set_trace()
+        # prototypes, bandwidth = merge_pototypes_bandwidth(prototypes.unflatten(0, select_coords.shape[:2]), bandwidth.unflatten(0, select_coords.shape[:2]))
+        # sim = gaussian(torch.abs(torch.cat(prototypes)[:, None, :] - vit_feat.flatten(-2).transpose(0,1).clone()[None, :, :]), torch.cat(bandwidth).unsqueeze(1))
+        # sim = sim.unflatten(-1, vit_feat.shape[-2:])
+        # split_size = [p.shape[0] for p in prototypes]
+        # sim = torch.split(sim, split_size, dim=0)
+
+        # prototypes = merge_pototypes(prototypes.unflatten(0, select_coords.shape[:2]))
+        # sim = F.softmax(sim, dim=-1)
         
         return prototypes, sim.unflatten(-1, vit_feat.shape[-2:]).clamp(0)
 
+
+    # def get_prototypes_bg(self, bg_map, fg_map, vit_feat, n_clusters=40):
+    #     max_val = bg_map.flatten(-2).max(dim=-1, keepdim=True)[0].unsqueeze(-1)
+    #     bg_mask = torch.where(bg_map > max_val*0.3, True, False).squeeze(1)
+    #     bg_mask[fg_map.squeeze(1)>0] = False
+    #     prot_bg = []
+    #     for i_obj in range(bg_mask.shape[0]):
+    #         mask = bg_mask[i_obj]
+    #         feats = vit_feat.permute(1,2,0)[mask]
+    #         cluster_ids_x, cluster_centers = kmeans(
+    #             X=feats, num_clusters=n_clusters, distance='cosine', device=vit_feat.device
+    #         )
+    #         prot_bg.append(cluster_centers)
+
+    #     return torch.stack(prot_bg)
+
+    # def get_mask_sample_points_roi_best_attn_feat_refine(self, 
+    #                                                     attn, 
+    #                                                     rois, 
+    #                                                     attn_idx, 
+    #                                                     vit_feat, 
+    #                                                     pos_thr=0.6, 
+    #                                                     neg_thr=0.6, 
+    #                                                     num_gt=20, 
+    #                                                     corr_size=21, 
+    #                                                     refine_times=2, 
+    #                                                     gt_points=None, 
+    #                                                     mean_shift_refine=False):
+    #     # Parameters:
+    #     #     attn: num_layers, num_points, H, W
+    #     #     roi: num_points, 4
+    #     # Return:
+    #     #     coords_chosen: num_points, num_gt, 2
+    #     #     labels_chosen: num_points, num_gt
+    #     num_points = attn.shape[1]
+    #     attn_map = attn.detach().clone()
+    #     attn_map = attn_map[attn_idx, torch.arange(num_points)] # num_points, num_pixels, 2
+    #     if mean_shift_refine:
+    #         map_cos_fg, map_cos_bg = get_cosine_similarity_refined_map(attn_map, 
+    #                                                                 vit_feat, 
+    #                                                                 rois, 
+    #                                                                 epoch=self.epoch, 
+    #                                                                 thr_pos=0.1, 
+    #                                                                 thr_neg=0.2, 
+    #                                                                 num_points=20, 
+    #                                                                 thr_fg=0.7,
+    #                                                                 refine_times=5, 
+    #                                                                 gt_points=gt_points)
+    #         fg_inter = F.interpolate(map_cos_fg[:, None, :, :], scale_factor=1/16, mode='bilinear')
+    #         bg_inter = F.interpolate(map_cos_bg[:, None, :, :], scale_factor=1/16, mode='bilinear')
+    #         for _ in range(5):
+    #             prototype_bg = self.get_prototypes_bg(bg_inter, fg_inter, vit_feat)
+    #             prototype_fg = (vit_feat * fg_inter).sum(dim=[-2,-1]) / (fg_inter.sum(dim=[-2,-1]) + 1e-8)
+    #             # prototype_bg = (vit_feat * bg_inter).sum(dim=[-2,-1]) / (bg_inter.sum(dim=[-2,-1]) + 1e-8)
+    #             # prototype_bg = (vit_feat * bg_inter).sum(dim=[-2,-1]) / (bg_inter.sum(dim=[-2,-1]) + 1e-8)
+    #             mean_shift_sim, mean_shift_dist  = self.mean_shift_refine_prototype(map_cos_fg, 
+    #                                                                     map_cos_bg, 
+    #                                                                     prototype_fg, 
+    #                                                                     prototype_bg, 
+    #                                                                     vit_feat,
+    #                                                                     rois,
+    #                                                                     n_shift=3)
+                
+    #         # mean_shift_sim = F.interpolate(mean_shift_sim, scale_factor=16, mode='bilinear')
+    #         # prototype_is_pos = mean_shift_dist.argmax(dim=-1) == 0
+    #         # prototype_is_pos = mean_shift_dist
+    #         # idx_prot = torch.arange(prototype_is_pos.shape[0], device=prototype_is_pos.device)[:, None].expand(-1, prototype_is_pos.shape[0]).flatten()
+    #     else:
+    #         map_cos_fg, map_cos_bg = get_cosine_similarity_refined_map(attn_map, vit_feat, rois, epoch=self.epoch, thr_pos=0.2, thr_neg=0.1, num_points=20, thr_fg=0.7, refine_times=5, gt_points=gt_points, return_feats=mean_shift_refine)
+        
+
+    #     coord_chosen = []
+    #     label_chosen = []
+    #     # num_objs = map_cos_fg[0].shape[0]
+    #     # for i_p, map_fg, map_bg in zip(range(num_objs), map_cos_fg[0], map_cos_bg[0]):
+    #     num_objs = map_cos_fg.shape[0]
+    #     for i_p, map_fg, map_bg in zip(range(num_objs), map_cos_fg, map_cos_bg):
+    #         # print(f'num_objs: {num_objs}')
+    #         # print(f'map_cos_fg.shape: {map_cos_fg.shape}')
+    #         # pdb.set_trace()
+    #         xmin, ymin, xmax, ymax = rois[i_p].int().tolist()
+    #         H, W = map_fg.shape[-2:]
+    #         map_crop_fg = map_fg[ymin:ymax, xmin:xmax]
+    #         map_crop_bg = map_bg[ymin:ymax, xmin:xmax]
+    #         coor, label = get_mask_points_single_box_cos_map_fg_bg(map_crop_fg, map_crop_bg, pos_thr=pos_thr, neg_thr=neg_thr, num_gt=num_gt,i=i_p, corr_size=corr_size)
+    #         coor[:, 0] += ymin
+    #         coor[:, 1] += xmin
+            
+    #         coor = coor.flip(1)
+    #         coord_chosen.append(coor)
+    #         label_chosen.append(label)
+    #     coords_chosen = torch.stack(coord_chosen).float()
+    #     labels_chosen= torch.stack(label_chosen)
+    #     return coords_chosen, labels_chosen, map_cos_fg, map_cos_bg, map_cos_fg, mean_shift_dist
 
     def get_mask_sample_points_roi_prots_best_attn_feat_refine(self, attn, rois, attn_idx, vit_feat, pos_thr=0.6, neg_thr=0.6, num_gt=20, corr_size=21, refine_times=2, obj_tau=0.85):
         # Parameters:
@@ -1559,7 +1973,7 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
         num_points = attn.shape[1]
         attn_map = attn.detach().clone()
         attn_map = attn_map[attn_idx, torch.arange(num_points)] # num_points, num_pixels, 2
-        map_cos_fg, map_cos_bg, points_bg, points_fg = get_cosine_similarity_refined_map(attn_map, vit_feat, rois, thr_pos=0.2, thr_neg=0.1, num_points=20, thr_fg=0.7, refine_times=refine_times, obj_tau=obj_tau, gt_points=gt_points)
+        map_cos_fg, map_cos_bg, points_bg, points_fg, feats_fg, feats_bg = get_cosine_similarity_refined_map(attn_map, vit_feat, rois, thr_pos=0.2, thr_neg=0.1, num_points=20, thr_fg=0.7, refine_times=refine_times, obj_tau=obj_tau, gt_points=gt_points)
         coord_chosen = []
         label_chosen = []
         num_objs = map_cos_fg[0].shape[0]
@@ -1576,7 +1990,7 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
             label_chosen.append(label)
         coords_chosen = torch.stack(coord_chosen).float()
         labels_chosen= torch.stack(label_chosen)
-        return coords_chosen, labels_chosen, map_cos_fg , map_cos_bg, points_bg, points_fg
+        return coords_chosen, labels_chosen, map_cos_fg , map_cos_bg, points_bg, points_fg, feats_fg, feats_bg
 
     def get_semantic_centers(self, 
                             map_cos_fg, 
@@ -1597,16 +2011,25 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
         map_cos_fg_corr = corrosion_batch(torch.where(map_cos_fg>pos_thr, torch.ones_like(map_cos_fg), torch.zeros_like(map_cos_fg))[None], corr_size=11)[0]
         fg_inter = F.interpolate(map_cos_fg_corr.unsqueeze(0), vit_feat.shape[-2:], mode='bilinear')[0]
         bg_inter = F.interpolate(map_cos_bg.unsqueeze(0).max(dim=1, keepdim=True)[0], vit_feat.shape[-2:], mode='bilinear')[0]
+        # pca = PCA(n_components=self.pca_dim)
+        # pca.fit(vit_feat.flatten(1).permute(1, 0).cpu().numpy())
+        # vit_feat_pca = torch.from_numpy(pca.fit_transform(vit_feat.flatten(1).permute(1, 0).cpu().numpy())).to(vit_feat.device)
+        # vit_feat_pca = vit_feat_pca.permute(1, 0).unflatten(1, vit_feat.shape[-2:])
+
+        vit_feat_pca = vit_feat
         map_fg = torch.where(fg_inter > pos_thr, torch.ones_like(fg_inter), torch.zeros_like(fg_inter))
 
-        prototypes_fg, sim_fg = self.mean_shift_grid_prototype(map_fg, vit_feat, rois, tau=0.1, temp=0.1, n_shift=refine_times)
+        prototypes_fg, sim_fg = self.mean_shift_grid_prototype(map_fg, vit_feat_pca, rois, tau=0.1, temp=0.1, n_shift=refine_times)
 
         sim_fg, idx_pos = filter_maps(sim_fg.unflatten(0, (sim_fg.shape[0]//20, 20)), fg_inter, bg_inter)
         split_size = idx_pos.sum(dim=-1).tolist()
         prototypes_fg = merge_maps(prototypes_fg[idx_pos.flatten()].split(split_size, dim=0), thr=merge_thr)
-        sim_fg = [cal_similarity(prot, vit_feat.permute(1,2,0)) for prot in prototypes_fg]
+        sim_fg = [cal_similarity(prot, vit_feat_pca.permute(1,2,0)) for prot in prototypes_fg]
+        # coord_semantic_center, coord_semantic_center_split = get_center_coord(sim_fg, rois, gt_labels, num_max_obj=num_semantic_points)
+        # return coord_semantic_center, coord_semantic_center_split, sim_fg
         coord_semantic_center, coord_semantic_center_split, feat_semantic_center_split, feat_semantic_center, num_parts, coord_sc_org, label_sc_org, corres_gt  = get_center_coord_with_feat(sim_fg, rois, gt_labels, vit_feat, num_max_obj=num_semantic_points)
         return coord_semantic_center, coord_semantic_center_split, sim_fg, feat_semantic_center_split, feat_semantic_center, num_parts, coord_sc_org, label_sc_org, corres_gt
+
 
     def get_mask_sample_points_roi_best_attn_local_global(self, 
                                                         attn, 
@@ -1652,9 +2075,15 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
                               torch.where((bg_inter > 0.35) & (fg_inter < 0.1), torch.ones_like(bg_inter), torch.zeros_like(bg_inter))))
         map_fg = torch.where(fg_inter > 0.35, torch.ones_like(fg_inter), torch.zeros_like(fg_inter))
 
-
+        # print(f'map_fgbg.shape: {map_fgbg.shape}')
+        # pdb.set_trace()
         prototypes_fg, sim_fg = self.mean_shift_grid_prototype(map_fg, vit_feat_pca, rois, tau=0.1, temp=1, n_shift=20)
 
+        # prototypes_fg, sim_fg = self.mean_shift_grid_prototype(torch.where(fg_inter > 0.35, torch.ones_like(fg_inter), torch.zeros_like(fg_inter)),
+        #                                 vit_feat_pca,
+        #                                 rois,
+        #                                 tau=25,
+        #                                 n_shift=20)
         bg_filter = torch.where((bg_inter > 0.35) & (fg_inter < 0.1), torch.ones_like(bg_inter), torch.zeros_like(bg_inter))
         bg_filter = torch.sum(bg_filter, dim=0, keepdim=True).clamp(0,1)
         fg_mask = fg_inter.sum(dim=0, keepdim=True).clamp(0,1)
@@ -1898,8 +2327,10 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
         labels_sc_org = []
         pseudo_gt_masks = []
         corres_gts = []
+        inst_fg_feat = []
+        inst_bg_feat = []
         for i_img in range(num_imgs):
-            coord_point, labels_point, map_cos_fg, map_cos_bg, points_bg, points_fg = self.get_mask_sample_points_roi_best_attn_feat_refine(attn_maps_dealed[i_img], mil_out[0][i_img], gt_box_index[i_img], 
+            coord_point, labels_point, map_cos_fg, map_cos_bg, points_bg, points_fg, feats_fg, feats_bg = self.get_mask_sample_points_roi_best_attn_feat_refine(attn_maps_dealed[i_img], mil_out[0][i_img], gt_box_index[i_img], 
                                                         vit_feat=vit_feat[i_img].clone(), pos_thr=pos_mask_thr, neg_thr=neg_mask_thr, num_gt=num_mask_point_gt, obj_tau=obj_tau, gt_points=center_points[i_img])
             semantic_centers, semantic_centers_split, sim_fg, feat_semantic_center_split, feat_semantic_centers, num_parts_obj, coord_sc_org, label_sc_org, corres_gt = self.get_semantic_centers(map_cos_fg[-1].clone(), 
                                                         map_cos_bg[-1].clone(), 
@@ -1925,7 +2356,13 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
             pseudo_gt_masks.append(torch.where(map_cos_fg[-1] > map_cos_fg[-1].flatten(1).max(1)[0][:, None, None] * pos_mask_thr, 
                                               torch.ones_like(map_cos_fg[-1]), 
                                               torch.zeros_like(map_cos_fg[-1])).to(torch.uint8).detach().cpu().numpy())
+            inst_fg_feat.append(feats_fg)
+            inst_bg_feat.append(feats_bg)
 
+        # pseudo_gt_mask, ignore_mask = self.get_pseudo_gt_masks_from_point_attn(cam_maps_images, gt_box_index)
+        
+        # points_attn_maps_images: list, length=#Imgs, points_attn_maps_images[i].shape: [n_layers, n_gts_i, H, W]
+        # gt_box_index: tuple, length=#Imgs, gt_box_index[i]: [#gts_i, ]
         if self.visualize:
             self.semantic_centers_split = semantic_centers_split_ret
             self.attns = attns
@@ -1954,6 +2391,8 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
                         semantic_centers_org=(coords_sc_org, labels_sc_org),
                         pseudo_gt_masks=pseudo_gt_masks,
                         corres_gts=corres_gts,
+                        inst_fg_feat=inst_fg_feat,
+                        inst_bg_feat=inst_bg_feat,
                         )
         else:
             return dict(pseudo_gt_labels=gt_labels,
@@ -1971,6 +2410,8 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
                         semantic_centers_org=(coords_sc_org, labels_sc_org),
                         pseudo_gt_masks=pseudo_gt_masks,
                         corres_gts=corres_gts,
+                        inst_fg_feat=inst_fg_feat,
+                        inst_bg_feat=inst_bg_feat,
                         )
     
 #     def seed_pseudo_gt(self,
@@ -2096,7 +2537,11 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
                       num_parts=None,
                       semantic_centers_org=None, #semantic_centers的数量比较少，因为有上限，而semantic_centers_org没有上限
                       map_cos_fg=None,
+                      map_cos_bg=None,
                       sc_corres_gts=None,
+                      inst_fg_feat=None,
+                      inst_bg_feat=None,
+                      pos_mask_thr=0.6,
                       ):
         """
         Args:
@@ -2162,6 +2607,24 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
             if gt_bboxes_ignore is None:
                 gt_bboxes_ignore = [None for _ in range(num_imgs)]
             sampling_results = []
+            def filter_bboxes_by_jitter(gt_bboxes, gt_labels, gt_centers, jitter_thr=0.05):
+                gt_bboxes_ignore = []
+                for i, bboxes in enumerate(gt_bboxes):
+                    centers = gt_centers[i]
+                    centers_box = (bboxes[:, :2] + bboxes[:, 2:]) / 2
+                    hw = (bboxes[:, 2:] - bboxes[:, :2]).clamp(1e-8)
+                    jitter = ((centers - centers_box).abs() / hw).max(dim=1)[0]
+                    ig_idx = jitter > jitter_thr
+                    bboxes_keep = bboxes[~ig_idx]
+                    labels_keep = gt_labels[i][~ig_idx]
+                    bboxes_ignore = bboxes[ig_idx]
+                    gt_bboxes_ignore.append(bboxes_ignore)
+                    gt_bboxes[i] = bboxes_keep
+                    gt_labels[i] = labels_keep
+                return gt_bboxes, gt_labels, gt_bboxes_ignore
+            
+            # gt_bboxes_keep, gt_labels_keep, gt_bboxes_ignore = filter_bboxes_by_jitter(gt_bboxes, gt_labels, gt_points)
+            # pdb.set_trace()
             for i in range(num_imgs):
                 assign_result = self.bbox_assigner.assign(
                     proposal_list[i], gt_bboxes[i], gt_bboxes_ignore[i],
@@ -2186,7 +2649,7 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
 #             bbox_results = self._bbox_forward_train(x, sampling_results,
 #                                                     gt_bboxes, gt_labels,
 #                                                     img_metas)
-          
+
 #             losses.update(bbox_results['loss_bbox'])
 #             losses.update(bbox_results['loss_bbox_rec'])
 
@@ -2197,8 +2660,66 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
                                                     img_metas, img=img)
             losses.update(bbox_results['loss_bbox'])
         
+        if self.with_reppoints_head:
+            reppoint_loss, semantic_centers_split_new  = self.reppoints_head[0].forward_train(
+                [xx.detach().clone() for xx in x], gt_bboxes, semantic_centers_org[0], img_metas, num_parts, gt_masks,
+                fg_maps=map_cos_fg, gt_labels=gt_labels)
+            losses.update(reppoint_loss)
+            if self.with_deform_sup:
+                semantic_centers_split = semantic_centers_split_new
+
+            semantic_centers = [torch.cat(sc) for sc in semantic_centers_split_new]
+            num_parts_1 = [[s.shape[0] for s in sc] for sc in semantic_centers_split_new]
+            for i in range(self.num_reppoints_head-1):
+                map_cos_fg_v1, gt_masks_v1 = self.update_fg_map(map_cos_fg, map_cos_bg, vit_feat.clone(), semantic_centers, num_parts_1, inst_fg_feat, inst_bg_feat, gt_bboxes, pos_mask_thr)
+                reppoint_loss_1, semantic_centers_split_new_1 = self.reppoints_head[i+1].forward_train(
+                    [xx.detach().clone() for xx in x], gt_bboxes, semantic_centers, img_metas, num_parts_1, gt_masks_v1,
+                    fg_maps=map_cos_fg_v1, gt_labels=gt_labels)
+                semantic_centers = [torch.cat(sc) for sc in semantic_centers_split_new_1]
+                num_parts_1 = [sc.shape[0] for sc in semantic_centers]
+                reppoint_loss_2 = dict()
+                for k in reppoint_loss_1.keys():
+                    reppoint_loss_2[k + f'_{i}'] = reppoint_loss_1[k]
+                losses.update(reppoint_loss_2)
+                
+            if self.with_deform_sup:
+                semantic_centers_split = semantic_centers_split_new_1
+            # visualize use only
+            save_dir = 'vis_imags'
+            os.makedirs(save_dir, exist_ok=True)
+            img_filename = img_metas[0]['filename']
+            img_name = os.path.basename(img_filename)
+            points_sc = semantic_centers_org[0][0].split(num_parts[0])
+            image = plt.imread(img_filename)
+            if img_metas[0]['flip']:
+                image = image[:,::-1,:]
+            image = cv2.resize(image, map_cos_fg[0].shape[-2:][::-1])
+            
+            for i_obj in range(gt_bboxes[0].shape[0]):
+                _, axes = plt.subplots(1, 6, squeeze=False)
+                axes[0, 0].imshow(image)
+                axes[0, 1].imshow(image)
+                axes[0, 2].imshow(image)
+                axes[0, 3].imshow(image)
+                axes[0, 1].imshow(map_cos_fg[0][i_obj].detach().cpu().numpy(), alpha=0.5, cmap='jet')
+                axes[0, 2].imshow(map_cos_fg_v1[0][i_obj].detach().cpu().numpy(), alpha=0.5, cmap='jet')
+
+                pts = points_sc[i_obj]
+                axes[0, 3].scatter(pts[:, 0].tolist(), pts[:, 1].tolist())
+                axes[0, 4].imshow(image)
+                point = semantic_centers_split_new[0][i_obj].cpu().numpy()
+                axes[0, 4].scatter(point[:, 0], point[:, 1], s=1, c='orange')
+                axes[0, 5].imshow(image)
+                point = semantic_centers_split_new_1[0][i_obj].cpu().numpy()
+                axes[0, 5].scatter(point[:, 0], point[:, 1], s=1, c='orange')
+                plt.savefig(f'{save_dir}/{img_name.split(".")[0]}-obj-{i_obj}.png')
+                plt.close('all')
+            # visualize use only
+
+
         # mask head forward and loss
         if self.with_mask:
+            # gt_masks_pseudo = self.get_pseudo_gt_masks_from_point_attn()
             mask_results = self._mask_forward_train(x, sampling_results,
                                                     bbox_results['bbox_feats'],
                                                     mask_point_coords, mask_point_labels,
@@ -2212,6 +2733,139 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
             losses.update(loss_rec)
 
         return losses
+
+    def update_fg_map(self, map_cos_fg, map_cos_bg, vit_feat, semantic_centers_coords, obj_num_parts, inst_fg_feat, inst_bg_feat, gt_bboxes, pos_mask_thr):
+        img_size = vit_feat.new_tensor(map_cos_fg[0].shape[-2:][::-1])
+        patch_size = (img_size.flip(0) // 16).long().tolist()
+        inst_fg_feat = [f[:, :, 0, 0][None] for f in inst_fg_feat]
+        inst_bg_feat = [f[:, :, 0, 0][None] for f in inst_bg_feat]
+# The above code is initializing two empty lists, `inst_attn` and `pseudo_gt_masks`. It then iterates
+# over the range of the number of rows in the `vit_feat` array.
+        inst_attn = []
+        pseudo_gt_masks = []
+        for i in range(vit_feat.shape[0]):
+            inst_attn.append(
+                self.update_fg_map_single_v3(map_cos_fg[i], vit_feat[[i]][:, 1:].permute(0,2,1).unflatten(-1, patch_size), 
+                    semantic_centers_coords[i], obj_num_parts[i], inst_fg_feat[i], inst_bg_feat[i], gt_bboxes[i], img_size)
+            )
+        for i in range(vit_feat.shape[0]):
+            attn = inst_attn[i]
+            attn_v0 = map_cos_fg[i]
+            drop_idx = attn.sum(dim=[1,2]) == 0
+            attn[drop_idx] = attn_v0[drop_idx]
+            pseudo_gt_masks.append(torch.where(attn > attn.flatten(1).max(1)[0][:, None, None] * pos_mask_thr, 
+                                                torch.ones_like(attn), 
+                                                torch.zeros_like(attn)).to(torch.uint8).detach().cpu().numpy())
+
+        return inst_attn, pseudo_gt_masks
+    
+    @torch.no_grad()
+    def update_fg_map_single(self, map_cos_fg, feats, coords, num_parts, inst_fg_feats, inst_bg_feats, bboxes, img_size):
+        normed_sc_coords = coords / img_size
+        semantic_centers_feat = point_sample(feats, normed_sc_coords[None]).permute(0,2,1)
+        # inst_feats = [torch.mean(torch.cat((f, s), dim=1), dim=1) for f, s in zip(inst_fg_feats.split(1, dim=1), semantic_centers_feat.split(num_parts, dim=1))]
+        inst_feats = [0.5*torch.mean(s, dim=1) + 0.5*f.reshape(1,-1) for f, s in zip(inst_fg_feats.split(1, dim=1), semantic_centers_feat.split(num_parts, dim=1))]
+
+        inst_feats.append(inst_fg_feats[:, -1])
+        inst_feats = torch.cat(inst_feats, dim=0)
+        bg_feats = inst_bg_feats
+        inst_attn_v1 = torch.einsum('nchw, nmc -> nmhw', feats / torch.norm(feats, p=2, keepdim=True, dim=1), 
+                                    inst_feats[None] / torch.norm(inst_feats[None], p=2, keepdim=True, dim=2))
+        inst_bg_attn = torch.einsum('nchw, nmc -> nmhw', feats / torch.norm(feats, p=2, keepdim=True, dim=1), 
+                                    bg_feats / torch.norm(bg_feats,  p=2, keepdim=True, dim=2))
+
+        bbox_mask = box2mask(bboxes//16, inst_attn_v1[0].shape[-2:], default_val=0)
+        inst_attn_v1[:, :-1] = inst_attn_v1[:, :-1] * bbox_mask[None]
+        inst_attn_v1 = F.interpolate(inst_attn_v1, map_cos_fg.shape[-2:], mode='bilinear')[0]
+        inst_bg_attn = F.interpolate(inst_bg_attn, map_cos_fg.shape[-2:], mode='bilinear')[0]
+
+        idx_max_aff = inst_attn_v1.argmax(0, keepdim=True).expand_as(inst_attn_v1)
+        range_obj = torch.arange(inst_attn_v1.shape[0], device=inst_attn_v1.device)
+        inst_attn_v1 = torch.where(idx_max_aff==range_obj[:,None,None], inst_attn_v1.clone(), torch.zeros_like(inst_attn_v1))[:-1]
+        inst_attn_v1 = (1 - inst_bg_attn) * inst_attn_v1
+        map_val = inst_attn_v1.flatten(-2, -1).max(-1, keepdim=True)[0].unsqueeze(-1).clamp(1e-8)
+        inst_attn_v1 /= map_val
+        
+        return inst_attn_v1.detach()
+
+    @torch.no_grad()
+    def update_fg_map_single_v1(self, map_cos_fg, feats, coords, num_parts, inst_fg_feats, inst_bg_feats, bboxes, img_size):
+        normed_sc_coords = coords / img_size
+        semantic_centers_feat = point_sample(feats, normed_sc_coords[None]).permute(0,2,1)
+        inst_feats = [torch.mean(torch.cat((f, s), dim=1), dim=1) for f, s in zip(inst_fg_feats.split(1, dim=1), semantic_centers_feat.split(num_parts, dim=1))]
+
+        inst_feats.append(inst_fg_feats[:, -1])
+        inst_feats = torch.cat(inst_feats, dim=0)
+        bg_feats = inst_bg_feats
+        inst_attn_v1 = torch.einsum('nchw, nmc -> nmhw', feats / torch.norm(feats, p=2, keepdim=True, dim=1), 
+                                    inst_feats[None] / torch.norm(inst_feats[None], p=2, keepdim=True, dim=2))
+        inst_bg_attn = torch.einsum('nchw, nmc -> nmhw', feats / torch.norm(feats, p=2, keepdim=True, dim=1), 
+                                    bg_feats / torch.norm(bg_feats,  p=2, keepdim=True, dim=2))
+        inst_attn_v1, _ = get_refined_similarity_input_map(inst_attn_v1[0], feats, bboxes, 3, is_select=True)
+        inst_attn_v1 = F.interpolate(inst_attn_v1[-1, :-1][None], map_cos_fg.shape[-2:], mode='bilinear')[0]
+        inst_bg_attn = F.interpolate(inst_bg_attn, map_cos_fg.shape[-2:], mode='bilinear')[0]
+        inst_attn_v1 = (1 - inst_bg_attn) * inst_attn_v1
+        map_val = inst_attn_v1.flatten(-2, -1).max(-1, keepdim=True)[0].unsqueeze(-1).clamp(1e-8)
+        inst_attn_v1 /= map_val
+        
+        return inst_attn_v1.detach()
+
+    @torch.no_grad()
+    def update_fg_map_single_v3(self, map_cos_fg, feats, coords, num_parts, inst_fg_feats, inst_bg_feats, bboxes, img_size):
+        normed_sc_coords = coords / img_size
+        semantic_centers_feat = point_sample(feats, normed_sc_coords[None]).permute(0,2,1)
+        inst_feats = []
+        semantic_centers_feat_split = semantic_centers_feat.split(num_parts, dim=1)
+        for i_f in range(bboxes.shape[0]):
+            if semantic_centers_feat_split[i_f].shape[0] != 0:
+                feat = torch.mean(semantic_centers_feat_split[i_f]) * 0.5 + inst_fg_feats[:, i_f] * 0.5
+            else:
+                feat = inst_fg_feats[:, i_f]
+            inst_feats.append(feat)
+        inst_feats.append(inst_fg_feats[:, -1])
+        inst_feats = torch.cat(inst_feats, dim=0)
+        bg_feats = inst_bg_feats
+        bg_map = map_cos_fg.sum(0) == 0
+        bg_sampled_coords = extract_bg_coords(bg_map, num_groups=1)
+        bg_sampled_feats = point_sample(feats, bg_sampled_coords[None], mode='bilinear')
+        bg_feats_supp = bg_sampled_feats.mean(-1).permute(0, 2, 1)[0]
+        inst_feats = torch.cat((inst_feats, bg_feats_supp), dim=0)
+        inst_attn_v1 = torch.einsum('nchw, nmc -> nmhw', feats / torch.norm(feats, p=2, keepdim=True, dim=1), 
+                                    inst_feats[None] / torch.norm(inst_feats[None], p=2, keepdim=True, dim=2))
+        inst_bg_attn = torch.einsum('nchw, nmc -> nmhw', feats / torch.norm(feats, p=2, keepdim=True, dim=1), 
+                                    bg_feats / torch.norm(bg_feats,  p=2, keepdim=True, dim=2))
+        inst_attn_v1, _ = get_refined_similarity_input_map(inst_attn_v1[0], feats, bboxes, 3, is_select=True)
+        inst_attn_v1 = F.interpolate(inst_attn_v1[-1, :bboxes.shape[0]][None], map_cos_fg.shape[-2:], mode='bilinear')[0]
+        inst_bg_attn = F.interpolate(inst_bg_attn, map_cos_fg.shape[-2:], mode='bilinear')[0]
+        inst_attn_v1 = (1 - inst_bg_attn) * inst_attn_v1
+        map_val = inst_attn_v1.flatten(-2, -1).max(-1, keepdim=True)[0].unsqueeze(-1).clamp(1e-8)
+        inst_attn_v1 /= map_val
+        
+        return inst_attn_v1.detach().clone()
+
+    @torch.no_grad()
+    def update_fg_map_single_v2(self, map_cos_fg, feats, coords, num_parts, inst_fg_feats, inst_bg_feats, bboxes, img_size):
+        normed_sc_coords = coords / img_size
+        semantic_centers_feat = point_sample(feats, normed_sc_coords[None]).permute(0,2,1)
+        inst_feats = [(0.9*f + 0.1*torch.mean(s, dim=1, keepdim=True)).squeeze(1) for f, s in zip(inst_fg_feats.split(1, dim=1), semantic_centers_feat.split(num_parts, dim=1))]
+        inst_feats.append(inst_fg_feats[:, -1])
+        inst_feats = torch.cat(inst_feats, dim=0)
+        bg_feats = inst_bg_feats
+        bg_map = map_cos_fg.sum(0) == 0
+        bg_sampled_coords = extract_bg_coords(bg_map)
+        bg_feats = None
+        inst_attn_v1 = torch.einsum('nchw, nmc -> nmhw', feats / torch.norm(feats, p=2, keepdim=True, dim=1), 
+                                    inst_feats[None] / torch.norm(inst_feats[None], p=2, keepdim=True, dim=2))
+        inst_bg_attn = torch.einsum('nchw, nmc -> nmhw', feats / torch.norm(feats, p=2, keepdim=True, dim=1), 
+                                    bg_feats / torch.norm(bg_feats,  p=2, keepdim=True, dim=2))
+        inst_attn_v1, _ = get_refined_similarity_input_map(inst_attn_v1[0], feats, bboxes, 3, is_select=True)
+        inst_attn_v1 = F.interpolate(inst_attn_v1[-1, :-1][None], map_cos_fg.shape[-2:], mode='bilinear')[0]
+        inst_bg_attn = F.interpolate(inst_bg_attn, map_cos_fg.shape[-2:], mode='bilinear')[0]
+        inst_attn_v1 = (1 - inst_bg_attn) * inst_attn_v1
+        map_val = inst_attn_v1.flatten(-2, -1).max(-1, keepdim=True)[0].unsqueeze(-1).clamp(1e-8)
+        inst_attn_v1 /= map_val
+        
+        return inst_attn_v1.detach()
 
     def get_pseudo_gt_masks_from_point_attn(self, cams, gt_index):
         # points_attn_maps_images: list, length=#Imgs, points_attn_maps_images[i].shape: [n_layers, n_gts_i, H, W]
@@ -2247,6 +2901,14 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
                 if self.with_bbox_rec:
                     assert True
                 else:
+#                     if len(bbox_feats) == 0:
+# #                         bbox_feats = extractor(x[:extractor.num_inputs], rois[-1:])
+# #                         cls_score, bbox_pred = head(bbox_feats) # 随机选择一个反例训练
+#                         num_classes = head.num_classes
+#                         out_dim_reg = 4 if head.reg_class_agnostic else 4 * num_classes
+#                         cls_score = torch.empty((0, num_classes + 1), dtype=torch.float16).to(bbox_feats.device)
+#                         bbox_pred = torch.empty((0, out_dim_reg), dtype=torch.float16).to(bbox_feats.device)
+#                     else:
                     cls_score, bbox_pred = head(bbox_feats)
                     
                     cls_scores.append(cls_score)
@@ -2357,6 +3019,45 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
 
         return bbox_results
 
+#     def _mask_forward_train(self, x, sampling_results, bbox_feats, gt_masks,
+#                             img_metas, ignore_mask=None):
+#         """Run forward function and calculate loss for mask head in
+#         training."""
+#         weight = None
+#         if not self.share_roi_extractor:
+#             pos_rois = bbox2roi([res.pos_bboxes for res in sampling_results])
+#             mask_results = self._mask_forward(x, pos_rois)
+#         else:
+#             pos_inds = []
+#             device = bbox_feats.device
+#             for res in sampling_results:
+#                 pos_inds.append(
+#                     torch.ones(
+#                         res.pos_bboxes.shape[0],
+#                         device=device,
+#                         dtype=torch.uint8))
+#                 pos_inds.append(
+#                     torch.zeros(
+#                         res.neg_bboxes.shape[0],
+#                         device=device,
+#                         dtype=torch.uint8))
+#             pos_inds = torch.cat(pos_inds)
+
+#             mask_results = self._mask_forward(
+#                 x, pos_inds=pos_inds, bbox_feats=bbox_feats)
+#         mask_targets = self.mask_head.get_targets(sampling_results, gt_masks,
+#                                                   self.train_cfg)
+#         if ignore_mask is not None:
+#             weight = self.mask_head.get_targets(sampling_results, ignore_mask,
+#                                                   self.train_cfg)
+
+#         pos_labels = torch.cat([res.pos_gt_labels for res in sampling_results])
+#         loss_mask = self.mask_head.loss(mask_results['mask_pred'],
+#                                         mask_targets, pos_labels, weight=weight)
+
+#         mask_results.update(loss_mask=loss_mask, mask_targets=mask_targets)
+#         return mask_results
+
     def _mask_forward(self, x, rois=None, pos_inds=None, bbox_feats=None):
         """Mask head forward function used in both training and testing."""
         assert ((rois is not None) ^
@@ -2372,6 +3073,23 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
         mask_pred = self.mask_head(mask_feats)
         mask_results = dict(mask_pred=mask_pred, mask_feats=mask_feats)
         return mask_results
+
+#     def _mask_forward(self, x, rois=None, pos_inds=None, bbox_feats=None):
+#         """Mask head forward function used in both training and testing."""
+#         assert (rois is not None) ^ (pos_inds is not None and bbox_feats is not None)
+#         if rois is not None:
+#             mask_feats = self.mask_roi_extractor(
+#                 x[: self.mask_roi_extractor.num_inputs], rois
+#             )
+#             if self.with_shared_head:
+#                 mask_feats = self.shared_head(mask_feats)
+#         else:
+#             assert bbox_feats is not None
+#             mask_feats = bbox_feats # 适应MAE的decoder的特性，所有的特征都输入到decoder中，只是返回的时候用pos_inds
+
+#         mask_pred = self.mask_head(mask_feats)
+#         mask_results = dict(mask_pred=mask_pred[pos_inds], mask_feats=mask_feats)
+#         return mask_results
 
     def _mask_forward_train(
         self, x, sampling_results, bbox_feats, points_coords, points_labels, img_metas=None, semantic_centers=None, **kwargs
@@ -2404,6 +3122,11 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
         )
         pos_labels = torch.cat([res.pos_gt_labels for res in sampling_results])
 
+        # assert points_labels[0].shape[1] == 5
+        # assert sites_img[0].shape[2] == 5
+        # res=sampling_results[1]
+        # res.pos_gt_labels
+        # try:
         pos_bboxes = torch.cat([res.pos_bboxes for res in sampling_results])
         sites = torch.cat(
             [
@@ -2438,6 +3161,8 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
 
         mask_results.update(loss_mask=loss_mask)  # , mask_targets=mask_targets)
         return mask_results
+        # except Exception as e:
+        #     print("error in _mask_forward_train: ", e)
 
     async def async_simple_test(self,
                                 x,
@@ -2621,6 +3346,10 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
             labels[pos_inds] = pos_gt_labels
             pos_weight = 1.0 if cfg.point_pos_weight <= 0 else cfg.point_pos_weight
             label_weights[pos_inds] = pos_weight
+#             if not self.reg_decoded_bbox:
+#                 pos_bbox_targets = self.bbox_coder.encode(
+#                     pos_bboxes, pos_gt_bboxes)
+#             else:
             pos_bbox_targets = pos_gt_bboxes 
             bbox_targets[pos_inds, :] = pos_bbox_targets
             bbox_weights[pos_inds, :] = 1
@@ -2745,7 +3474,7 @@ class AttnShiftRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
                 dict[str, Tensor]: Dictionary of loss components
         """
         losses = dict()
-        bg_class_ind = self.bbox_head.num_classes
+        bg_class_ind = self.bbox_head.num_classes 
         # note in spare rcnn num_gt == num_pos
         pos_inds = (labels >= 0) & (labels < bg_class_ind)
         num_pos = pos_inds.sum().float()
